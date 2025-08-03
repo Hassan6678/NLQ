@@ -1,0 +1,10 @@
+*.pyc
+.DS_Store
+backup
+chroma
+
+*.db
+*.sqlite
+*.csv
+
+/models/**
