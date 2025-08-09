@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from contextlib import contextmanager
 import json
+import re
 
 import pandas as pd
 import duckdb
@@ -200,13 +201,16 @@ class DatabaseManager:
     def _initialize_connections(self):
         """Initialize connection pool."""
         for i in range(config.database.connection_pool_size):
-            conn = duckdb.connect()
+            # Use a shared on-disk DuckDB database so all pooled connections
+            # see the same tables loaded during the session.
+            conn = duckdb.connect(config.database.db_path)
             # Optimize DuckDB settings
             conn.execute(f"SET memory_limit='{config.database.memory_limit}'")
             conn.execute(f"SET threads={config.database.threads}")
             conn.execute(f"SET enable_progress_bar=false")
             if config.database.enable_parallel:
-                conn.execute("SET enable_parallel=true")
+                conn.execute("PRAGMA threads=4")
+                # conn.execute("SET enable_parallel=true")
             self.connections.append(conn)
         
         logger.info(f"Initialized {len(self.connections)} database connections")
@@ -219,7 +223,7 @@ class DatabaseManager:
                 conn = self.connections.pop()
             else:
                 # Create new connection if pool is empty
-                conn = duckdb.connect()
+                conn = duckdb.connect(config.database.db_path)
                 logger.warning("Connection pool exhausted, creating new connection")
         
         try:
@@ -269,7 +273,8 @@ class DatabaseManager:
                         self.table_schemas[table_name] = {
                             "columns": list(chunk.columns),
                             "schema": ", ".join(schema_info),
-                            "sample_data": chunk.head(3).to_dict('records')
+                            "sample_data": chunk.head(3).to_dict('records'),
+                            "table_name": table_name
                         }
                         
                         first_chunk = False
@@ -455,6 +460,7 @@ class LLMManager:
         schema = table_info.get("schema", "")
         sample_data = table_info.get("sample_data", [])
         row_count = table_info.get("row_count", 0)
+        table_name_for_prompt = table_info.get("table_name", "sales_data")
         
         # Build sample data context
         sample_context = ""
@@ -475,7 +481,7 @@ class LLMManager:
         prompt = f"""### You are an expert SQL generator for DuckDB.
 ### Given the following table schema and context:
 
-# Table: {table_info.get('table_name', 'data_table')}
+# Table: {table_name_for_prompt}
 # Schema: {schema}
 # Total rows: {row_count:,}
 {sample_context}
@@ -483,6 +489,7 @@ class LLMManager:
 
 ### Important guidelines:
 - Use DuckDB SQL syntax
+ - The ONLY available table is named "{table_name_for_prompt}". You must use exactly this table name in all FROM and JOIN clauses. Do not invent any other table names.
 - For large datasets, consider using LIMIT for exploratory queries
 - Use appropriate aggregations for summary queries
 - Handle NULL values appropriately
@@ -508,7 +515,18 @@ SELECT"""
                 prompt,
                 temperature=config.model.temperature,
                 max_tokens=config.model.max_tokens,
-                stop=["###", "\n\n"]
+                stop=[
+                    "###",
+                    "\n\n",
+                    "assistant",
+                    "Assistant",
+                    "ASSISTANT",
+                    "User:",
+                    "USER:",
+                    "```",
+                    "<|assistant|>",
+                    "</s>"
+                ]
             )
             
             generation_time = time.time() - start_time
@@ -545,17 +563,29 @@ SELECT"""
                     return None
             
             # Extract SQL statement
-            if "SELECT" in text.upper():
-                sql_start = text.upper().find("SELECT")
+            text_upper = text.upper()
+            if "SELECT" in text_upper:
+                sql_start = text_upper.find("SELECT")
                 sql_text = text[sql_start:]
-                
-                # Find the end of the SQL statement
+
+                # Find the earliest end delimiter (case-insensitive)
                 sql_end = len(sql_text)
-                for delimiter in [";", "\n\n", "###"]:
-                    pos = sql_text.find(delimiter)
+                lower_sql_text = sql_text.lower()
+                delimiters = [
+                    ";",
+                    "\n\n",
+                    "###",
+                    "assistant",
+                    "user:",
+                    "```",
+                    "<|assistant|>",
+                    "</s>"
+                ]
+                for delimiter in delimiters:
+                    pos = lower_sql_text.find(delimiter)
                     if pos != -1:
                         sql_end = min(sql_end, pos)
-                
+
                 sql = sql_text[:sql_end].strip()
                 
                 # Add semicolon if not present
@@ -581,9 +611,11 @@ SELECT"""
             return False
         
         # Check for dangerous operations (basic safety)
-        dangerous_keywords = ["DROP", "DELETE", "TRUNCATE", "ALTER", "CREATE"]
+        # Allow CREATE VIEW/TABLE when we are the ones creating during load,
+        # but prevent it in generated query. Keep validation conservative.
+        dangerous_keywords = [" DROP ", " DELETE ", " TRUNCATE ", " ALTER ", " CREATE "]
         for keyword in dangerous_keywords:
-            if keyword in sql_upper:
+            if keyword in f" {sql_upper} ":
                 logger.warning(f"Potentially dangerous SQL keyword detected: {keyword}")
                 return False
         
@@ -640,6 +672,9 @@ class NLQSystem:
                 # Cache the generated SQL
                 self.cache.cache_sql(nlq, sql)
             
+            # Normalize/ensure the correct table name is used in the SQL
+            sql = self._normalize_sql_table_name(sql, table_name)
+            
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
             if cached_result:
@@ -669,6 +704,33 @@ class NLQSystem:
             self.metrics.errors += 1
             logger.error(f"Query failed: {e}")
             raise
+
+    def _normalize_sql_table_name(self, sql: str, expected_table: str) -> str:
+        """Ensure generated SQL references the expected table name.
+        Rewrites FROM/JOIN targets that don't match `expected_table`.
+        """
+        try:
+            # Also strip stray chat tokens like trailing 'assistant' that may have
+            # slipped past stop tokens and delimiters.
+            sql = re.sub(r"(?i)(assistant|<\|assistant\|>|</s>)$", "", sql).strip()
+
+            pattern = r"(?i)\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.\"]*)(\s|$)"
+
+            def replace_match(match: re.Match) -> str:
+                keyword = match.group(1)
+                table_identifier = match.group(2)
+                trailing = match.group(3)
+
+                # Strip quotes and schema qualifier for comparison
+                table_core = table_identifier.strip('`"').split('.')[-1]
+
+                if table_core != expected_table:
+                    return f"{keyword} {expected_table}{trailing}"
+                return match.group(0)
+
+            return re.sub(pattern, replace_match, sql)
+        except Exception:
+            return sql
     
     def get_performance_report(self) -> Dict[str, Any]:
         """Generate comprehensive performance report."""

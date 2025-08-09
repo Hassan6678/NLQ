@@ -19,6 +19,7 @@ class DatabaseConfig:
     threads: int = 4
     enable_parallel: bool = True
     cache_size: str = "512MB"
+    db_path: str = "nlq.duckdb"
 
 
 @dataclass

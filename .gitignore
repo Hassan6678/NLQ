@@ -59,6 +59,8 @@ Desktop.ini
 
 # Database files
 *.db
+*.duckdb
+*.wal
 *.sqlite
 *.sqlite3
 chroma/
