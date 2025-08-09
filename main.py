@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from contextlib import contextmanager
 import json
+import argparse
 import re
 
 import pandas as pd
@@ -254,21 +255,25 @@ class DatabaseManager:
             
             try:
                 # Read CSV in chunks
-                for chunk in pd.read_csv(file_path, chunksize=config.database.chunk_size):
+                for chunk in pd.read_csv(file_path, chunksize=config.database.chunk_size, low_memory=False):
+                    # Heuristically coerce dtypes so numeric/boolean columns are not treated as text
+                    chunk = self._coerce_chunk_dtypes(chunk)
                     chunk_count += 1
                     chunk_rows = len(chunk)
                     total_rows += chunk_rows
                     
                     if first_chunk:
-                        # Create table with first chunk
-                        conn.register(table_name, chunk)
-                        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {table_name}")
+                        # Create table with first chunk using a temporary view name
+                        temp_initial = f"temp_initial_chunk_{int(time.time())}"
+                        conn.register(temp_initial, chunk)
+                        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {temp_initial}")
+                        conn.execute(f"DROP VIEW IF EXISTS {temp_initial}")
                         
-                        # Store schema information
+                        # Store schema information (after coercion)
                         schema_info = []
                         for col, dtype in chunk.dtypes.items():
                             sql_type = self._pandas_to_sql_type(dtype)
-                            schema_info.append(f"{col} {sql_type}")
+                            schema_info.append(f"{self._quote_identifier(col)} {sql_type}")
                         
                         self.table_schemas[table_name] = {
                             "columns": list(chunk.columns),
@@ -284,7 +289,7 @@ class DatabaseManager:
                         temp_table = f"temp_chunk_{chunk_count}"
                         conn.register(temp_table, chunk)
                         conn.execute(f"INSERT INTO {table_name} SELECT * FROM {temp_table}")
-                        conn.execute(f"DROP VIEW {temp_table}")
+                        conn.execute(f"DROP VIEW IF EXISTS {temp_table}")
                     
                     # Log progress
                     if chunk_count % 10 == 0:
@@ -326,6 +331,7 @@ class DatabaseManager:
         if pd.api.types.is_integer_dtype(dtype):
             return "INTEGER"
         elif pd.api.types.is_float_dtype(dtype):
+            # Prefer DECIMAL for money-like columns; DOUBLE otherwise.
             return "DOUBLE"
         elif pd.api.types.is_datetime64_any_dtype(dtype):
             return "TIMESTAMP"
@@ -342,7 +348,11 @@ class DatabaseManager:
             columns = [row[0] for row in result]
             
             # Create indexes on common column patterns
-            index_patterns = ['id', 'date', 'time', 'region', 'category', 'type']
+            index_patterns = [
+                'id', 'date', 'time', 'region', 'category', 'type',
+                'month', 'year', 'city', 'brand', 'sku', 'customer',
+                'territory', 'route', 'area', 'distributor'
+            ]
             
             for col in columns:
                 col_lower = col.lower()
@@ -355,6 +365,48 @@ class DatabaseManager:
                         
         except Exception as e:
             logger.warning(f"Error creating indexes: {e}")
+    
+    def _coerce_chunk_dtypes(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """Attempt to coerce object-typed columns to numeric or boolean where appropriate.
+        This prevents saving numeric columns (e.g., "primary sales") as VARCHAR.
+        """
+        try:
+            coerced = chunk.copy()
+            # Pre-known boolean-like columns
+            boolean_candidates = {"productivity", "stockout", "assortment"}
+            for col in coerced.columns:
+                series = coerced[col]
+                # Force month/year to integers if possible
+                if col.lower() in {"month", "year"}:
+                    coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
+                    continue
+                if pd.api.types.is_bool_dtype(series):
+                    continue
+                if pd.api.types.is_numeric_dtype(series):
+                    continue
+                if pd.api.types.is_object_dtype(series):
+                    # Try boolean coercion first
+                    if col.lower() in boolean_candidates:
+                        str_vals = series.astype(str).str.strip().str.lower()
+                        true_set = {"true", "1", "yes"}
+                        false_set = {"false", "0", "no"}
+                        if str_vals.isin(true_set | false_set).mean() > 0.9:
+                            coerced[col] = str_vals.map(lambda v: True if v in true_set else (False if v in false_set else pd.NA)).astype("boolean")
+                            continue
+                    # Try numeric coercion with cleanup for commas and currency symbols
+                    cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
+                    numeric = pd.to_numeric(cleaned, errors="coerce")
+                    non_null_ratio = numeric.notna().mean()
+                    if non_null_ratio > 0.9:  # mostly numeric
+                        # Choose integer if no fractional part, else float
+                        if (numeric.dropna() % 1 == 0).all():
+                            coerced[col] = numeric.astype("Int64")
+                        else:
+                            coerced[col] = numeric.astype("float64")
+                        continue
+            return coerced
+        except Exception:
+            return chunk
     
     def execute_query(self, sql: str) -> QueryResult:
         """Execute SQL query with performance monitoring."""
@@ -423,6 +475,14 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"Error getting table info: {e}")
                 return self.table_schemas[table_name]
+
+    def _quote_identifier(self, name: str) -> str:
+        """Quote identifier if it contains spaces or non-word characters.
+        DuckDB uses double quotes for quoted identifiers.
+        """
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            return name
+        return '"' + name.replace('"', '""') + '"'
 
 
 class LLMManager:
@@ -494,6 +554,9 @@ class LLMManager:
 - Use appropriate aggregations for summary queries
 - Handle NULL values appropriately
 - Use proper date/time functions if applicable
+ - Columns may include names with spaces (e.g., "primary sales"). When referencing such columns, use double quotes, e.g., "primary sales".
+ - Months and years are integers. If the question mentions a quarter (Q1..Q4), map to months: Q1={1,2,3}, Q2={4,5,6}, Q3={7,8,9}, Q4={10,11,12}.
+ - Booleans are stored as TRUE/FALSE. For boolean filters, use syntax like stockout = TRUE or productivity = FALSE.
 
 ### Write a SQL query to answer the question:
 # {nlq}
@@ -674,6 +737,10 @@ class NLQSystem:
             
             # Normalize/ensure the correct table name is used in the SQL
             sql = self._normalize_sql_table_name(sql, table_name)
+            # Quote any column identifiers that require quoting (e.g., contain spaces)
+            sql = self._quote_columns_with_spaces_in_sql(sql, table_name)
+            # Enforce semantic column preferences (e.g., prefer "primary sales" when requested)
+            sql = self._enforce_semantic_column_preference(nlq, sql, table_name)
             
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
@@ -731,6 +798,106 @@ class NLQSystem:
             return re.sub(pattern, replace_match, sql)
         except Exception:
             return sql
+
+    def _quote_columns_with_spaces_in_sql(self, sql: str, table_name: str) -> str:
+        """Automatically quote column names that contain spaces or non-word chars
+        if they appear unquoted in the generated SQL. This reduces errors for
+        columns like "primary sales".
+        """
+        try:
+            table_info = self.db_manager.table_schemas.get(table_name, {})
+            columns: List[str] = table_info.get("columns", [])
+            cols_needing_quotes = [
+                col for col in columns
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col)
+            ]
+
+            if not cols_needing_quotes:
+                return sql
+
+            def replace_outside_quotes(text: str, target: str, replacement: str) -> str:
+                result_chars: List[str] = []
+                i = 0
+                in_single = False
+                in_double = False
+                length = len(text)
+                tlen = len(target)
+                while i < length:
+                    ch = text[i]
+                    if ch == "'" and not in_double:
+                        in_single = not in_single
+                        result_chars.append(ch)
+                        i += 1
+                        continue
+                    if ch == '"' and not in_single:
+                        in_double = not in_double
+                        result_chars.append(ch)
+                        i += 1
+                        continue
+                    if not in_single and not in_double and text.startswith(target, i):
+                        result_chars.append(replacement)
+                        i += tlen
+                        continue
+                    result_chars.append(ch)
+                    i += 1
+                return "".join(result_chars)
+
+            updated_sql = sql
+            for col in cols_needing_quotes:
+                updated_sql = replace_outside_quotes(updated_sql, col, f'"{col}"')
+            return updated_sql
+        except Exception:
+            return sql
+
+    def _enforce_semantic_column_preference(self, nlq: str, sql: str, table_name: str) -> str:
+        """If the natural language mentions a specific metric that has a column with
+        spaces (e.g., "primary sales"), prefer that column over similarly named ones
+        like "sales". Only adjusts when unambiguous and columns exist.
+        """
+        try:
+            table_info = self.db_manager.table_schemas.get(table_name, {})
+            columns: List[str] = table_info.get("columns", [])
+            nlq_lower = nlq.lower()
+
+            def replace_word_outside_quotes(text: str, word: str, replacement: str) -> str:
+                result_chars: List[str] = []
+                i = 0
+                in_single = False
+                in_double = False
+                length = len(text)
+                wlen = len(word)
+                while i < length:
+                    ch = text[i]
+                    if ch == "'" and not in_double:
+                        in_single = not in_single
+                        result_chars.append(ch)
+                        i += 1
+                        continue
+                    if ch == '"' and not in_single:
+                        in_double = not in_double
+                        result_chars.append(ch)
+                        i += 1
+                        continue
+                    if not in_single and not in_double:
+                        # Check whole-word match boundaries
+                        if i + wlen <= length and text[i:i+wlen].lower() == word.lower():
+                            prev_ch = text[i-1] if i > 0 else "\0"
+                            next_ch = text[i+wlen] if i + wlen < length else "\0"
+                            if not (prev_ch.isalnum() or prev_ch == "_") and not (next_ch.isalnum() or next_ch == "_"):
+                                result_chars.append(replacement)
+                                i += wlen
+                                continue
+                    result_chars.append(ch)
+                    i += 1
+                return "".join(result_chars)
+
+            # Prefer "primary sales" if the user explicitly mentions it and both columns exist
+            if ("primary sales" in nlq_lower) and ("primary sales" in columns) and ("sales" in columns):
+                sql = replace_word_outside_quotes(sql, "sales", '"primary sales"')
+
+            return sql
+        except Exception:
+            return sql
     
     def get_performance_report(self) -> Dict[str, Any]:
         """Generate comprehensive performance report."""
@@ -770,6 +937,24 @@ memory_monitor = MemoryMonitor()
 nlq_system = None
 
 
+def _format_dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with numeric columns formatted as strings
+    with thousands separators and fixed decimals for floats.
+    This is used only for pretty printing to the console.
+    """
+    formatted = df.copy()
+    for col in formatted.columns:
+        series = formatted[col]
+        try:
+            if pd.api.types.is_integer_dtype(series):
+                formatted[col] = series.map(lambda x: f"{int(x):,}" if pd.notnull(x) else "")
+            elif pd.api.types.is_float_dtype(series):
+                formatted[col] = series.map(lambda x: f"{float(x):,.2f}" if pd.notnull(x) else "")
+        except Exception:
+            pass
+    return formatted
+
+
 def initialize_system() -> NLQSystem:
     """Initialize the NLQ system with configuration validation."""
     global nlq_system
@@ -802,10 +987,12 @@ def run_query(question: str, table_name: str = "sales_data") -> None:
         if result.row_count > 0:
             # Display results with smart formatting
             if result.row_count <= 20:
-                print(result.data.to_string(index=False))
+                display_df = _format_dataframe_for_display(result.data)
+                print(display_df.to_string(index=False))
             else:
                 print("First 10 rows:")
-                print(result.data.head(10).to_string(index=False))
+                display_df = _format_dataframe_for_display(result.data.head(10))
+                print(display_df.to_string(index=False))
                 print(f"\n... and {result.row_count - 10:,} more rows")
         else:
             print("No results found.")
@@ -828,19 +1015,32 @@ def main():
         
         # Load data
         print("Loading sales data...")
-        if os.path.exists("sales.csv"):
-            load_result = system.load_data("sales.csv", "sales_data")
+        if os.path.exists("./data/llm_dataset_v10.gz"):
+            load_result = system.load_data("./data/llm_dataset_v10.gz", "sales_data")
             print(f"✅ Loaded {load_result['total_rows']:,} rows in {load_result['duration']:.2f}s")
         else:
-            print("❌ sales.csv not found. Please ensure the file exists.")
+            print("❌ sales not found. Please ensure the file exists.")
             return
         
-        # Example queries
+        # Example queries tailored to your schema
         example_queries = [
-            "What were the total sales in Q3 for the Northeast?",
-            "Show me the top 5 regions by sales",
-            "What is the average sales per quarter?",
-            "Which quarter had the highest sales overall?"
+            # Aggregations and time filters
+            "What were the total sales in November 2024 in Central-A?",
+            "Show the top 10 cities by total sales in 2024",
+            "What is the total primary sales in Q3 2024?",
+
+            # Dimensional breakdowns
+            "List the top 5 brands by sales in Lahore",
+            "What are the top 5 customers by sales in 2024?",
+
+            # Booleans and KPIs
+            "How many rows had stockouts in 2024?",
+            "What is the average mro for productive rows in 2024?",
+            "What percent of rows were assortment = TRUE in Central-A?",
+
+            # Mixed filters
+            "Total sales for brand CHOCO LAVA in Lahore-A Territory in November 2024",
+            "Show the top 5 routes by sales for distributor D0715 in 2024"
         ]
         
         print("\n🚀 Running example queries...")

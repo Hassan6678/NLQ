@@ -54,6 +54,7 @@ Desktop.ini
 # =============================================================================
 # Large CSV files (>100MB should use Git LFS)
 *.csv
+*.gz
 !sample_data.csv
 !test_data.csv
 
