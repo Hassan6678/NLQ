@@ -1027,7 +1027,7 @@ def main():
             # Aggregations and time filters
             "What were the total sales in November 2024 in Central-A?",
             "Show the top 10 cities by total sales in 2024",
-            "What is the total primary sales in Q3 2024?",
+            # "What is the total primary sales in Q3 2024?",
 
             # Dimensional breakdowns
             "List the top 5 brands by sales in Lahore",
