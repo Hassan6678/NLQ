@@ -61,6 +61,7 @@ st.markdown("""
     
     .error-box {
         background-color: #f8d7da;
+        color: #721c24; 
         border: 1px solid #f5c6cb;
         border-radius: 5px;
         padding: 1rem;
@@ -338,12 +339,18 @@ def main():
     # Query interface
     st.markdown("## 🔍 Ask a Question")
     
-    # Query input
-    query_text = st.text_input(
-        "Enter your question about the sales data:",
-        placeholder="e.g., What were the total sales in Q3 2024?",
-        key="query_input"
-    )
+    # Query input (submit on Enter using form)
+    with st.form(key="query_form", clear_on_submit=False):
+        query_text = st.text_input(
+            "Enter your question about the sales data:",
+            placeholder="e.g., What were the total sales in Q3 2024?",
+            key="query_input"
+        )
+        cols = st.columns([2, 1, 1])
+        with cols[1]:
+            execute_button = st.form_submit_button("🚀 Execute", use_container_width=True)
+        with cols[2]:
+            cancel_button = st.form_submit_button("🛑 Cancel", use_container_width=True)
     
     # Check if example query was selected
     if 'example_query' in st.session_state:
@@ -351,16 +358,27 @@ def main():
         del st.session_state.example_query
         st.rerun()
     
-    # Execute query button
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        execute_button = st.button("🚀 Execute Query", use_container_width=True, disabled=not query_text.strip())
+    # Immediate cancel action
+    if cancel_button:
+        try:
+            if st.session_state.nlq_system:
+                canceled = st.session_state.nlq_system.cancel_running_query()
+                if canceled:
+                    st.warning("Query cancellation requested.")
+                else:
+                    st.info("No running query to cancel.")
+        except Exception as e:
+            st.error(f"Cancel failed: {e}")
     
     # Execute query
     if execute_button and query_text.strip():
         try:
+            # Soft timeout watchdog: if > 10 minutes, show busy message
+            start_time = time.time()
             with st.spinner("🤔 Processing your question..."):
                 result = execute_query(query_text.strip())
+                if time.time() - start_time > 600:
+                    st.error("Server is too busy right now")
             
             # Add to query history
             st.session_state.query_history.append({

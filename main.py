@@ -196,6 +196,8 @@ class DatabaseManager:
     def __init__(self):
         self.connections = []
         self.connection_lock = threading.Lock()
+        self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
+        self.active_lock = threading.Lock()
         self.table_schemas = {}
         self._initialize_connections()
     
@@ -460,9 +462,12 @@ class DatabaseManager:
     def execute_query(self, sql: str) -> QueryResult:
         """Execute SQL query with performance monitoring."""
         start_time = time.time()
-        
+        thread_id = threading.get_ident()
         with self.get_connection() as conn:
             try:
+                # Register active connection for potential cancellation
+                with self.active_lock:
+                    self.active_connections[thread_id] = conn
                 result_df = conn.execute(sql).fetchdf()
                 execution_time = time.time() - start_time
                 memory_usage = memory_monitor.get_memory_usage()
@@ -484,12 +489,20 @@ class DatabaseManager:
                 logger.error(f"SQL execution error: {e}")
                 logger.error(f"SQL: {sql}")
                 raise
+            finally:
+                # Unregister active connection
+                with self.active_lock:
+                    self.active_connections.pop(thread_id, None)
     
     def get_table_info(self, table_name: str) -> Dict[str, Any]:
         """Get comprehensive table information."""
         if table_name not in self.table_schemas:
             return {}
-        
+        # Return cached extended info if present
+        cached = self.table_schemas.get(table_name, {})
+        if cached.get("row_count") is not None and cached.get("column_stats") is not None:
+            return cached
+
         with self.get_connection() as conn:
             try:
                 # Get row count
@@ -515,15 +528,46 @@ class DatabaseManager:
                     except:
                         pass
                 
-                return {
+                enriched = {
                     **self.table_schemas[table_name],
                     "row_count": row_count,
                     "column_stats": stats
                 }
+                # Cache enriched info for subsequent calls
+                self.table_schemas[table_name] = enriched
+                return enriched
                 
             except Exception as e:
                 logger.error(f"Error getting table info: {e}")
                 return self.table_schemas[table_name]
+
+    def cancel_query_for_thread(self, thread_id: Optional[int] = None) -> bool:
+        """Attempt to cancel a running query for the given thread (or current thread).
+        Returns True if a cancellation signal was sent.
+        """
+        try:
+            tid = thread_id if thread_id is not None else threading.get_ident()
+            with self.active_lock:
+                conn = self.active_connections.get(tid)
+            if conn is None:
+                return False
+            # Prefer interrupt if available
+            if hasattr(conn, "interrupt"):
+                try:
+                    conn.interrupt()
+                    return True
+                except Exception as e:
+                    logger.warning(f"interrupt() failed: {e}")
+            # Fallback: close connection
+            try:
+                conn.close()
+                return True
+            except Exception as e:
+                logger.warning(f"close() failed during cancel: {e}")
+                return False
+        except Exception as e:
+            logger.warning(f"cancel_query_for_thread failed: {e}")
+            return False
 
     def _quote_identifier(self, name: str) -> str:
         """Quote identifier if it contains spaces or non-word characters.
@@ -833,7 +877,10 @@ class NLQSystem:
                 sql = self.llm_manager.generate_sql(prompt)
                 
                 if not sql:
-                    raise ValueError("Could not generate valid SQL from query")
+                    # Rule-based fallback for robustness
+                    sql = self._build_rule_based_sql(nlq, table_name)
+                    if not sql:
+                        raise ValueError("Could not generate valid SQL from query")
                 
                 # Cache the generated SQL
                 self.cache.cache_sql(nlq, sql)
@@ -855,12 +902,30 @@ class NLQSystem:
                 self.metrics.cache_hits += 1
                 return cached_result
             
-            # Execute query
-            with memory_monitor.monitor_operation("Query execution"):
-                result = self.db_manager.execute_query(sql)
+            # Execute query with smart repair fallback on aggregation errors
+            sql_to_run = sql
+            try:
+                with memory_monitor.monitor_operation("Query execution"):
+                    result = self.db_manager.execute_query(sql_to_run)
+            except Exception as exec_err:
+                # Try a single smart repair for common binder errors
+                if self._is_binder_aggregation_error(exec_err) or self._is_column_binding_error(exec_err):
+                    # First fix alias misuse (e.g., s.total_target -> s.target / total_target)
+                    repaired_sql = self._repair_alias_misuse_in_sql(sql_to_run)
+                    # Then ensure measures are aggregated when grouping
+                    repaired_sql = self._repair_aggregation_in_sql(repaired_sql, table_name)
+                    if repaired_sql and repaired_sql != sql_to_run:
+                        logger.info("Retrying query after SQL repair")
+                        sql_to_run = repaired_sql
+                        with memory_monitor.monitor_operation("Query execution (repaired)"):
+                            result = self.db_manager.execute_query(sql_to_run)
+                    else:
+                        raise
+                else:
+                    raise
             
-            # Cache the result
-            self.cache.cache_result(sql, result)
+            # Cache the result (for the actual SQL executed)
+            self.cache.cache_result(sql_to_run, result)
             
             # Update metrics
             self.metrics.query_count += 1
@@ -877,6 +942,227 @@ class NLQSystem:
             self.metrics.errors += 1
             logger.error(f"Query failed: {e}")
             raise
+
+    def cancel_running_query(self) -> bool:
+        """Cancel the query running in the current thread if possible."""
+        return self.db_manager.cancel_query_for_thread()
+
+    # ---------------- Smart SQL repair utilities ---------------------------
+    def _is_binder_aggregation_error(self, err: Exception) -> bool:
+        text = str(err).lower()
+        return (
+            "must appear in the group by clause" in text or
+            "must be part of an aggregate function" in text
+        )
+
+    def _is_column_binding_error(self, err: Exception) -> bool:
+        text = str(err).lower()
+        return (
+            "does not have a column named" in text or
+            "no such column" in text or
+            "not found in" in text
+        )
+
+    def _repair_aggregation_in_sql(self, sql: str, table_name: str) -> str:
+        """Attempt to wrap measure columns in SUM() within SELECT/ORDER BY.
+        This addresses errors when non-aggregated measures are selected alongside grouped dimensions.
+        Keeps dimensional columns untouched. Best-effort regex approach.
+        """
+        try:
+            # Measures to aggregate
+            measures = [
+                'sales', 'mro', 'mto', 'target', 'primary sales',
+                'stockout_mro', 'unproductive_mro', 'unassorted_mro'
+            ]
+
+            # Build patterns for alias-qualified and bare names
+            # e.g., s.sales -> SUM(s.sales); "primary sales" -> SUM("primary sales")
+            # Operate only inside SELECT ... FROM and ORDER BY ... (until LIMIT/end)
+            def find_section(text: str, start_kw: str, end_kws: List[str]) -> Tuple[int, int]:
+                m = re.search(rf"(?is)\b{start_kw}\b", text)
+                if not m:
+                    return (-1, -1)
+                start = m.end()
+                end = len(text)
+                for ek in end_kws:
+                    em = re.search(rf"(?is)\b{ek}\b", text[start:])
+                    if em:
+                        end = start + em.start()
+                        break
+                return (start, end)
+
+            def wrap_measures(segment: str) -> str:
+                if not segment:
+                    return segment
+                # Replace alias-qualified measures first
+                for meas in sorted(measures, key=len, reverse=True):
+                    quoted = f'"{meas}"'
+                    # alias."primary sales" or alias.sales
+                    pattern_alias_quoted = rf"(?<!SUM\()\b([A-Za-z_][A-Za-z0-9_]*)\.(\"{re.escape(meas)}\")\b"
+                    pattern_alias_bare = rf"(?<!SUM\()\b([A-Za-z_][A-Za-z0-9_]*)\.{re.escape(meas)}\b"
+                    segment = re.sub(pattern_alias_quoted, r"SUM(\1.\2)", segment, flags=re.IGNORECASE)
+                    segment = re.sub(pattern_alias_bare, rf"SUM(\1.{meas})", segment, flags=re.IGNORECASE)
+                    # bare quoted or bare name
+                    pattern_bare_quoted = rf"(?<!SUM\()\b(\"{re.escape(meas)}\")\b"
+                    pattern_bare = rf"(?<!SUM\()\b{re.escape(meas)}\b"
+                    segment = re.sub(pattern_bare_quoted, r"SUM(\1)", segment, flags=re.IGNORECASE)
+                    segment = re.sub(pattern_bare, rf"SUM({meas})", segment, flags=re.IGNORECASE)
+                return segment
+
+            lower_sql = sql.lower()
+            # SELECT segment
+            s_start = re.search(r"(?is)\bselect\b", sql)
+            f_from = re.search(r"(?is)\bfrom\b", sql)
+            if s_start and f_from and s_start.end() < f_from.start():
+                pre = sql[:s_start.end()]
+                select_body = sql[s_start.end():f_from.start()]
+                post = sql[f_from.start():]
+                select_body = wrap_measures(select_body)
+                sql = pre + select_body + post
+
+            # ORDER BY segment
+            ob_start, ob_end = find_section(sql, 'order\s+by', ['limit'])
+            if ob_start != -1:
+                pre = sql[:ob_start]
+                ob_body = sql[ob_start:ob_end]
+                post = sql[ob_end:]
+                ob_body = wrap_measures(ob_body)
+                sql = pre + ob_body + post
+
+            return sql
+        except Exception as e:
+            logger.warning(f"_repair_aggregation_in_sql failed: {e}")
+            return sql
+
+    def _repair_alias_misuse_in_sql(self, sql: str) -> str:
+        """Repair misuse of SELECT aliases as if they were base columns (e.g., s.total_target).
+        Replace patterns like SUM(s.total_target) -> SUM(s.target), SUM(total_sales) -> SUM(sales),
+        and standalone s.total_target -> total_target where appropriate.
+        """
+        try:
+            updated = sql
+            # Inside SUM()
+            updated = re.sub(r"(?is)SUM\(\s*([A-Za-z_][A-Za-z0-9_]*)\.total_target\s*\)", r"SUM(\1.target)", updated)
+            updated = re.sub(r"(?is)SUM\(\s*([A-Za-z_][A-Za-z0-9_]*)\.total_sales\s*\)", r"SUM(\1.sales)", updated)
+            updated = re.sub(r"(?is)SUM\(\s*total_target\s*\)", "SUM(target)", updated)
+            updated = re.sub(r"(?is)SUM\(\s*total_sales\s*\)", "SUM(sales)", updated)
+
+            # Standalone alias-qualified references -> plain alias
+            updated = re.sub(r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\.total_target\b", "total_target", updated)
+            updated = re.sub(r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\.total_sales\b", "total_sales", updated)
+            return updated
+        except Exception as e:
+            logger.warning(f"_repair_alias_misuse_in_sql failed: {e}")
+            return sql
+
+    # ---------------- Rule-based fallback SQL ------------------------------
+    def _build_rule_based_sql(self, nlq: str, table_name: str) -> Optional[str]:
+        """Construct a simple, robust SQL for common query shapes when LLM fails.
+        Supports queries like:
+          - Which <dimension> has most/least <metric or opportunity> in <month/quarter/year>?
+        Metrics recognized: sales, mro (growth opportunity/potential improvement), mto, target, primary sales.
+        Dimensions recognized: region, city, area, territory, distributor, route, brand, sku, customer.
+        """
+        try:
+            nlq_lower = nlq.lower()
+            # Determine dimension
+            candidate_dims = [
+                "region", "city", "area", "territory", "distributor", "route", "brand", "sku", "customer"
+            ]
+            table_cols = [c.lower() for c in self.db_manager.table_schemas.get(table_name, {}).get("columns", [])]
+            chosen_dim = None
+            for dim in candidate_dims:
+                if dim in nlq_lower and dim in table_cols:
+                    chosen_dim = dim
+                    break
+            if chosen_dim is None:
+                # Default to region if present, else first textual column
+                if "region" in table_cols:
+                    chosen_dim = "region"
+                else:
+                    chosen_dim = next((c for c in table_cols if c not in {"month","year"}), None)
+            if chosen_dim is None:
+                return None
+
+            # Determine metric
+            metric = self._choose_metric_from_nlq(nlq_lower, table_cols)
+            if metric is None:
+                metric = "sales" if "sales" in table_cols else ("mro" if "mro" in table_cols else None)
+            if metric is None:
+                return None
+
+            # Direction (most vs least)
+            asc_terms = ["least", "lowest", "worst", "minimum", "min"]
+            desc_terms = ["most", "highest", "top", "best", "maximum", "max"]
+            order_dir = "DESC"
+            if any(t in nlq_lower for t in asc_terms):
+                order_dir = "ASC"
+            elif any(t in nlq_lower for t in desc_terms):
+                order_dir = "DESC"
+
+            # Time filters (month/year)
+            year, months = self._extract_periods_from_nlq(nlq_lower)
+            if months and year is None:
+                # Use latest year containing the latest mentioned month
+                guess_year = self.db_manager.get_latest_year_for_month(table_name, max(months))
+                year = guess_year
+            if year is None and not months:
+                # Default to latest month
+                periods = self.db_manager.get_latest_periods(table_name, 1)
+                if periods:
+                    year, m = periods[0]
+                    months = [m]
+
+            # Quote identifiers
+            dim_sql = self.db_manager._quote_identifier(chosen_dim)
+            metric_sql = self.db_manager._quote_identifier(metric)
+
+            alias_metric = re.sub(r"[^A-Za-z0-9_]+", "_", metric)
+            where_parts = []
+            if year:
+                where_parts.append(f"year = {int(year)}")
+            if months:
+                month_list = ", ".join(str(int(m)) for m in sorted(set(months)))
+                where_parts.append(f"month IN ({month_list})")
+            where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+            sql = (
+                f"SELECT {dim_sql}, SUM({metric_sql}) AS total_{alias_metric} "
+                f"FROM {table_name}"
+                f"{where_clause} "
+                f"GROUP BY {dim_sql} "
+                f"ORDER BY total_{alias_metric} {order_dir} "
+                f"LIMIT 1;"
+            )
+            return sql
+        except Exception as e:
+            logger.warning(f"_build_rule_based_sql failed: {e}")
+            return None
+
+    def _choose_metric_from_nlq(self, nlq_lower: str, table_cols: List[str]) -> Optional[str]:
+        """Infer metric column from NLQ text with synonyms and fallbacks."""
+        try:
+            if any(term in nlq_lower for term in [
+                "growth opportunity", "potential improvement", "missed revenue", "missed gain",
+                "untapped potential", "lost earnings", "mro", "opportunity"
+            ]):
+                if "mro" in table_cols:
+                    return "mro"
+            if any(term in nlq_lower for term in ["missed target", "target missed", "sales shortfall", "performance gap", "mto"]):
+                if "mto" in table_cols:
+                    return "mto"
+            if any(term in nlq_lower for term in ["primary sales", "primary contribution"]):
+                if "primary sales" in table_cols:
+                    return "primary sales"
+            if any(term in nlq_lower for term in ["target"]):
+                if "target" in table_cols:
+                    return "target"
+            if any(term in nlq_lower for term in ["sales", "revenue", "contribution"]):
+                if "sales" in table_cols:
+                    return "sales"
+            return None
+        except Exception:
+            return None
 
     # ---------------- Dynamic time and growth handling ---------------------
     def _apply_dynamic_time_logic(self, nlq: str, sql: str, table_name: str) -> str:
@@ -905,17 +1191,29 @@ class NLQSystem:
             # Respect explicit periods in NLQ if we detected them
             if extracted_months or extracted_year is not None:
                 # Try to fill missing year using latest available if not specified
-                year_to_use = extracted_year
+                year_to_use: Optional[int] = extracted_year
                 if year_to_use is None:
-                    if len(extracted_months) == 1:
-                        # Find the latest year that contains this month
-                        guess_year = self.db_manager.get_latest_year_for_month(table_name, list(extracted_months)[0])
-                        year_to_use = guess_year
+                    if len(extracted_months) >= 1:
+                        # Find the latest year that contains the latest mentioned month
+                        month_latest = max(extracted_months) if extracted_months else None
+                        if month_latest is not None:
+                            guess_year = self.db_manager.get_latest_year_for_month(table_name, month_latest)
+                            year_to_use = guess_year
                 # If still None, fall back to latest
                 if year_to_use is None:
                     latest_periods = self.db_manager.get_latest_periods(table_name, limit=1)
                     if latest_periods:
                         year_to_use = latest_periods[0][0]
+
+                if self._is_growth_query(nlq_lower):
+                    # If only one month given (e.g., December), use that as latest and include previous month
+                    month_latest = max(extracted_months) if extracted_months else None
+                    if month_latest is not None and year_to_use is not None:
+                        return self._rewrite_growth_to_specific(sql, table_name, year_to_use, month_latest)
+                    # Fallback to latest two if month not identifiable
+                    return self._rewrite_growth_to_latest(sql, table_name)
+
+                # Non-growth queries: inject specified months (or single month) with chosen year
                 return self._inject_time_filter_into_sql(sql, year=year_to_use if year_to_use else 0, months=sorted(extracted_months))
 
             # Growth question with no explicit months: use latest two
@@ -982,6 +1280,35 @@ class NLQSystem:
             return updated
         except Exception as e:
             logger.warning(f"_rewrite_growth_to_latest failed: {e}")
+            return sql
+
+    def _rewrite_growth_to_specific(self, sql: str, table_name: str, latest_year: int, latest_month: int) -> str:
+        """Rewrite growth SQL to target a specific latest month and its previous month in the same year when available,
+        otherwise roll over to prior year for previous month. Injects month IN (prev, latest) and year filter if missing.
+        """
+        try:
+            # Compute previous month/year
+            if latest_month == 1:
+                prev_month = 12
+                prev_year = latest_year - 1
+            else:
+                prev_month = latest_month - 1
+                prev_year = latest_year
+
+            updated = sql
+            # Replace generic month IN pairs if present
+            updated = re.sub(r"(?is)month\s+in\s*\(\s*\d+\s*,\s*\d+\s*\)", f"month IN ({prev_month}, {latest_month})", updated)
+            # Replace CASE WHEN month = X THEN ... patterns
+            updated = re.sub(r"(?is)CASE\s+WHEN\s+month\s*=\s*\d+\s+THEN", f"CASE WHEN month = {latest_month} THEN", updated, count=1)
+            updated = re.sub(r"(?is)CASE\s+WHEN\s+month\s*=\s*\d+\s+THEN", f"CASE WHEN month = {prev_month} THEN", updated, count=1)
+            # Normalize year: if any explicit year present, align latest year; otherwise inject year clause
+            if self._sql_has_year_filter(updated):
+                updated = re.sub(r"(?is)year\s*=\s*\d{4}", f"year = {latest_year}", updated)
+            else:
+                updated = self._inject_time_filter_into_sql(updated, year=latest_year, months=[prev_month, latest_month])
+            return updated
+        except Exception as e:
+            logger.warning(f"_rewrite_growth_to_specific failed: {e}")
             return sql
 
     def _inject_time_filter_into_sql(self, sql: str, year: int, months: List[int]) -> str:
