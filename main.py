@@ -365,6 +365,55 @@ class DatabaseManager:
                         
         except Exception as e:
             logger.warning(f"Error creating indexes: {e}")
+
+    # --- Time period helpers -------------------------------------------------
+    def get_latest_periods(self, table_name: str, limit: int = 2) -> List[Tuple[int, int]]:
+        """Return up to 'limit' most recent (year, month) pairs present in the table.
+        Sorted descending by year then month.
+        """
+        try:
+            with self.get_connection() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT year, month
+                    FROM {table_name}
+                    WHERE year IS NOT NULL AND month IS NOT NULL
+                    GROUP BY year, month
+                    ORDER BY year DESC, month DESC
+                    LIMIT {int(limit)}
+                    """
+                ).fetchall()
+                return [(int(y), int(m)) for (y, m) in rows]
+        except Exception as e:
+            logger.warning(f"get_latest_periods failed: {e}")
+            return []
+
+    def get_latest_year_for_month(self, table_name: str, month: int) -> Optional[int]:
+        """Return the most recent year that contains the given month."""
+        try:
+            with self.get_connection() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT MAX(year) FROM {table_name}
+                    WHERE month = ?
+                    """,
+                    [int(month)],
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+        except Exception as e:
+            logger.warning(f"get_latest_year_for_month failed: {e}")
+            return None
+
+    def has_columns(self, table_name: str, columns: List[str]) -> bool:
+        """Check whether the given columns exist in the table."""
+        try:
+            with self.get_connection() as conn:
+                result = conn.execute(f"DESCRIBE {table_name}").fetchall()
+                existing = {row[0].lower() for row in result}
+                return all(col.lower() in existing for col in columns)
+        except Exception as e:
+            logger.warning(f"has_columns failed: {e}")
+            return False
     
     def _coerce_chunk_dtypes(self, chunk: pd.DataFrame) -> pd.DataFrame:
         """Attempt to coerce object-typed columns to numeric or boolean where appropriate.
@@ -516,7 +565,9 @@ class LLMManager:
             raise
     
     def build_enhanced_prompt(self, nlq: str, table_info: Dict[str, Any]) -> str:
-        """Build enhanced prompt with table context and examples."""
+        """Build enhanced prompt with table context, dataset info, and examples.
+        Includes supported query types distilled from prompt guidance.
+        """
         schema = table_info.get("schema", "")
         sample_data = table_info.get("sample_data", [])
         row_count = table_info.get("row_count", 0)
@@ -557,6 +608,58 @@ class LLMManager:
  - Columns may include names with spaces (e.g., "primary sales"). When referencing such columns, use double quotes, e.g., "primary sales".
  - Months and years are integers. If the question mentions a quarter (Q1..Q4), map to months: Q1={1,2,3}, Q2={4,5,6}, Q3={7,8,9}, Q4={10,11,12}.
  - Booleans are stored as TRUE/FALSE. For boolean filters, use syntax like stockout = TRUE or productivity = FALSE.
+
+### Dataset information
+- The ONLY table to use is "{table_name_for_prompt}" (use this exact name).
+- Data is monthly with integer columns: month (1..12), year (e.g., 2024).
+- Columns include: region, city, area, territory, distributor, route, customer, sku, brand, variant, packtype, sales, "primary sales", target, mto, productivity, mro, stockout, assortment, and specialized mro components.
+- If the question omits months/years, prefer the latest available period(s).
+
+### Supported query types
+- Sales/revenue totals and rankings by any dimension.
+- Growth analysis (latest vs previous month; or user-specified periods/quarters).
+- Targets and gaps: target, mto, mro, and their aggregations.
+- Productivity/assortment/stockout counts and percentages (COUNT(DISTINCT customer)/total).
+- Time filters: specific months, years, or quarters (Q1..Q4).
+
+### Example patterns (adjust filters and dimensions):
+1) Worst productivity percentage by distributor in a city for a month:
+SELECT region, city, area, territory, distributor,
+  COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
+  COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) AS unproductive_shops,
+  COUNT(DISTINCT customer) AS total_shops,
+  (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS productivity_percentage,
+  (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS unproductivity_percentage
+FROM {table_name_for_prompt}
+WHERE city = 'lahore'
+GROUP BY region, city, area, territory, distributor
+ORDER BY unproductivity_percentage DESC
+LIMIT 1;
+
+2) Routes with highest stockout percentage in a region for a month:
+SELECT region, city, area, territory, distributor, route,
+  COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
+  COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 0 THEN customer END) AS not_stockout_shops,
+  COUNT(DISTINCT customer) AS total_shops,
+  (COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS stockout_percentage
+FROM {table_name_for_prompt}
+WHERE region = 'north b'
+GROUP BY region, city, area, territory, distributor, route
+ORDER BY stockout_percentage DESC
+LIMIT 1;
+
+3) City growth (replace months with latest/previous if user didn't specify):
+SELECT region, city,
+  SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) AS sales_current_month,
+  SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END) AS sales_previous_month,
+  ((SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) -
+    SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END)) /
+   NULLIF(SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END), 0)) * 100 AS sales_growth_percentage
+FROM {table_name_for_prompt}
+WHERE city = 'lahore'
+GROUP BY region, city
+ORDER BY sales_growth_percentage DESC
+LIMIT 1;
 
 ### Write a SQL query to answer the question:
 # {nlq}
@@ -742,6 +845,9 @@ class NLQSystem:
             # Enforce semantic column preferences (e.g., prefer "primary sales" when requested)
             sql = self._enforce_semantic_column_preference(nlq, sql, table_name)
             
+            # Apply dynamic time logic (months/years) before caching result
+            sql = self._apply_dynamic_time_logic(nlq, sql, table_name)
+
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
             if cached_result:
@@ -771,6 +877,201 @@ class NLQSystem:
             self.metrics.errors += 1
             logger.error(f"Query failed: {e}")
             raise
+
+    # ---------------- Dynamic time and growth handling ---------------------
+    def _apply_dynamic_time_logic(self, nlq: str, sql: str, table_name: str) -> str:
+        """Inject sensible default time filters and rewrite growth queries to use
+        latest available periods when the user has not explicitly specified months/years.
+        """
+        try:
+            # Only act if table has month/year columns
+            if not self.db_manager.has_columns(table_name, ["month", "year"]):
+                return sql
+
+            nlq_lower = nlq.lower()
+            extracted_year, extracted_months = self._extract_periods_from_nlq(nlq_lower)
+
+            # If SQL already has some time filters, optionally strengthen with missing pieces
+            if self._sql_has_time_filters(sql):
+                # If months are present in SQL but year is missing and NLQ specified a year, inject the year
+                if self._sql_has_month_filter(sql) and not self._sql_has_year_filter(sql) and extracted_year is not None:
+                    return self._inject_time_filter_into_sql(sql, year=extracted_year, months=[])
+                # If NLQ asked for growth without explicit months in NLQ or SQL, rewrite to latest
+                if self._is_growth_query(nlq_lower) and not extracted_months:
+                    return self._rewrite_growth_to_latest(sql, table_name)
+                return sql
+
+            # No time filters present in SQL
+            # Respect explicit periods in NLQ if we detected them
+            if extracted_months or extracted_year is not None:
+                # Try to fill missing year using latest available if not specified
+                year_to_use = extracted_year
+                if year_to_use is None:
+                    if len(extracted_months) == 1:
+                        # Find the latest year that contains this month
+                        guess_year = self.db_manager.get_latest_year_for_month(table_name, list(extracted_months)[0])
+                        year_to_use = guess_year
+                # If still None, fall back to latest
+                if year_to_use is None:
+                    latest_periods = self.db_manager.get_latest_periods(table_name, limit=1)
+                    if latest_periods:
+                        year_to_use = latest_periods[0][0]
+                return self._inject_time_filter_into_sql(sql, year=year_to_use if year_to_use else 0, months=sorted(extracted_months))
+
+            # Growth question with no explicit months: use latest two
+            if self._is_growth_query(nlq_lower):
+                return self._rewrite_growth_to_latest(sql, table_name)
+
+            # Non-growth and no explicit period: constrain to latest month by default
+            latest_periods = self.db_manager.get_latest_periods(table_name, limit=1)
+            if latest_periods:
+                latest_year, latest_month = latest_periods[0]
+                return self._inject_time_filter_into_sql(sql, year=latest_year, months=[latest_month])
+            return sql
+        except Exception as e:
+            logger.warning(f"_apply_dynamic_time_logic failed: {e}")
+            return sql
+
+    def _is_growth_query(self, nlq_lower: str) -> bool:
+        return any(word in nlq_lower for word in ["growth", "grow", "growing", "expansion", "increase", "decrease"]) \
+            or " vs " in nlq_lower or "compare" in nlq_lower
+
+    def _sql_has_time_filters(self, sql: str) -> bool:
+        pat = r"(?is)\b(year\s*=\s*\d{4}|year\s+in\s*\(|month\s*=\s*\d{1,2}|month\s+in\s*\()"
+        return re.search(pat, sql) is not None
+
+    def _sql_has_year_filter(self, sql: str) -> bool:
+        return re.search(r"(?is)\byear\s*(=|in\s*\()", sql) is not None
+
+    def _sql_has_month_filter(self, sql: str) -> bool:
+        return re.search(r"(?is)\bmonth\s*(=|in\s*\()", sql) is not None
+
+    def _rewrite_growth_to_latest(self, sql: str, table_name: str) -> str:
+        """Rewrite hard-coded growth month pairs to latest available periods.
+        Looks for CASE WHEN month = X THEN ... constructs and IN (X,Y) lists.
+        If such constructs are not found, inject WHERE year/month filters for latest two periods.
+        """
+        try:
+            periods = self.db_manager.get_latest_periods(table_name, limit=2)
+            if not periods:
+                return sql
+            (y1, m1) = periods[0]
+            # Compute previous period
+            if len(periods) >= 2:
+                (y0, m0) = periods[1]
+            else:
+                # Derive previous month when only one period in table
+                if m1 == 1:
+                    y0, m0 = (y1 - 1, 12)
+                else:
+                    y0, m0 = (y1, m1 - 1)
+
+            updated = sql
+            # Replace month IN (...) pairs commonly appearing as (10, 11)
+            updated = re.sub(r"(?is)month\s+in\s*\(\s*\d+\s*,\s*\d+\s*\)", f"month IN ({m0}, {m1})", updated)
+            # Replace CASE WHEN month = X/ Y patterns
+            updated = re.sub(r"(?is)CASE\s+WHEN\s+month\s*=\s*\d+\s+THEN", f"CASE WHEN month = {m1} THEN", updated, count=1)
+            updated = re.sub(r"(?is)CASE\s+WHEN\s+month\s*=\s*\d+\s+THEN", f"CASE WHEN month = {m0} THEN", updated, count=1)
+            # Replace explicit year constraints if present to latest year
+            updated = re.sub(r"(?is)year\s*=\s*\d{4}", f"year = {y1}", updated)
+
+            # If no time filters present after replacement, inject where with latest two
+            if not self._sql_has_time_filters(updated):
+                updated = self._inject_time_filter_into_sql(updated, year=y1, months=[m0, m1])
+
+            return updated
+        except Exception as e:
+            logger.warning(f"_rewrite_growth_to_latest failed: {e}")
+            return sql
+
+    def _inject_time_filter_into_sql(self, sql: str, year: int, months: List[int]) -> str:
+        """Insert year/month constraints into SQL, preserving existing clauses order."""
+        try:
+            clauses = []
+            if year:
+                clauses.append(f"year = {year}")
+            if months:
+                clauses.append("month IN (" + ", ".join(str(m) for m in sorted(set(months))) + ")")
+            if not clauses:
+                return sql
+            where_clause = " AND ".join(clauses)
+            # Identify insertion point: before GROUP BY/ORDER BY/LIMIT end
+            tokens = [" GROUP BY ", " ORDER BY ", " LIMIT "]
+            lower = sql.lower()
+            insert_pos = len(sql)
+            for token in tokens:
+                pos = lower.find(token.lower())
+                if pos != -1:
+                    insert_pos = min(insert_pos, pos)
+            head = sql[:insert_pos]
+            tail = sql[insert_pos:]
+
+            if re.search(r"(?is)\bwhere\b", head):
+                head = re.sub(r"(?is)\bwhere\b", "WHERE", head, count=1)  # normalize case
+                head = re.sub(r"(?is)WHERE", f"WHERE {where_clause} AND", head, count=1)
+            else:
+                # Trim trailing semicolon in head, will re-add at end of pipeline
+                head = head.rstrip("; ")
+                head += f" WHERE {where_clause}"
+            return head + tail
+        except Exception as e:
+            logger.warning(f"_inject_time_filter_into_sql failed: {e}")
+            return sql
+
+    def _extract_periods_from_nlq(self, nlq_lower: str) -> Tuple[Optional[int], List[int]]:
+        """Extract year and months from the user's natural language question.
+        - Detect 4-digit years
+        - Detect quarters Q1..Q4 and map to months
+        - Detect month names/abbreviations
+        Returns (year, months_list)
+        """
+        year: Optional[int] = None
+        months: List[int] = []
+
+        # Year
+        m = re.search(r"\b(20\d{2})\b", nlq_lower)
+        if m:
+            try:
+                year = int(m.group(1))
+            except Exception:
+                year = None
+
+        # Quarter
+        qm = re.search(r"\bq([1-4])\b", nlq_lower)
+        if qm:
+            q = int(qm.group(1))
+            q_map = {1: [1,2,3], 2: [4,5,6], 3: [7,8,9], 4: [10,11,12]}
+            months.extend(q_map[q])
+
+        # Month names/abbreviations
+        month_name_map = {
+            'jan': 1, 'january': 1,
+            'feb': 2, 'february': 2,
+            'mar': 3, 'march': 3,
+            'apr': 4, 'april': 4,
+            'may': 5,
+            'jun': 6, 'june': 6,
+            'jul': 7, 'july': 7,
+            'aug': 8, 'august': 8,
+            'sep': 9, 'sept': 9, 'september': 9,
+            'oct': 10, 'october': 10,
+            'nov': 11, 'november': 11,
+            'dec': 12, 'december': 12,
+        }
+        for name, num in month_name_map.items():
+            if re.search(rf"\b{name}\b", nlq_lower):
+                months.append(num)
+
+        # Numeric months like "month 11" sometimes present; avoid false positives on years
+        for nm in re.findall(r"\bmonth\s*(=|is|:)\s*(\d{1,2})\b", nlq_lower):
+            try:
+                months.append(int(nm[1]))
+            except Exception:
+                pass
+
+        # Dedup and sort
+        months = sorted(set([m for m in months if 1 <= m <= 12]))
+        return year, months
 
     def _normalize_sql_table_name(self, sql: str, expected_table: str) -> str:
         """Ensure generated SQL references the expected table name.
