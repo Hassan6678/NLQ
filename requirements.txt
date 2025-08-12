@@ -13,3 +13,6 @@ fastparquet>=0.8.0  # For Parquet support
 pytest>=7.0.0
 pytest-benchmark>=4.0.0
 memory-profiler>=0.60.0
+
+# Web interface
+streamlit>=1.28.0
