@@ -1,8 +1,3 @@
-"""
-Production-ready NLQ (Natural Language Query) system for large datasets.
-Optimized for handling 1M+ rows with memory efficiency and performance.
-"""
-
 import os
 import sys
 import time
@@ -423,7 +418,7 @@ class DatabaseManager:
         """
         try:
             coerced = chunk.copy()
-            # Pre-known boolean-like columns
+            # Pre-known boolean-like columns (store as 0/1 integers for SQL simplicity)
             boolean_candidates = {"productivity", "stockout", "assortment"}
             for col in coerced.columns:
                 series = coerced[col]
@@ -431,19 +426,32 @@ class DatabaseManager:
                 if col.lower() in {"month", "year"}:
                     coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
                     continue
+                # Convert boolean-like columns to 0/1 integer dtype
+                if col.lower() in boolean_candidates:
+                    str_vals = series.astype(str).str.strip().str.lower()
+                    true_set = {"true", "1", "yes", "y", "t"}
+                    false_set = {"false", "0", "no", "n", "f"}
+                    # Try to map to 0/1 where possible
+                    mapped = str_vals.map(lambda v: 1 if v in true_set else (0 if v in false_set else pd.NA))
+                    # If mapping produced sufficient non-nulls, adopt it
+                    if mapped.notna().mean() > 0.9:
+                        coerced[col] = mapped.astype("Int64")
+                        continue
+                    # Else, if numeric 0/1 already
+                    numeric = pd.to_numeric(series, errors="coerce")
+                    if numeric.notna().mean() > 0.9 and set(numeric.dropna().unique()).issubset({0,1}):
+                        coerced[col] = numeric.astype("Int64")
+                        continue
+                    # Finally, if true boolean dtype, cast to Int64 0/1
+                    if pd.api.types.is_bool_dtype(series):
+                        coerced[col] = series.astype("Int64")
+                        continue
                 if pd.api.types.is_bool_dtype(series):
+                    # For other boolean columns, keep as boolean
                     continue
                 if pd.api.types.is_numeric_dtype(series):
                     continue
                 if pd.api.types.is_object_dtype(series):
-                    # Try boolean coercion first
-                    if col.lower() in boolean_candidates:
-                        str_vals = series.astype(str).str.strip().str.lower()
-                        true_set = {"true", "1", "yes"}
-                        false_set = {"false", "0", "no"}
-                        if str_vals.isin(true_set | false_set).mean() > 0.9:
-                            coerced[col] = str_vals.map(lambda v: True if v in true_set else (False if v in false_set else pd.NA)).astype("boolean")
-                            continue
                     # Try numeric coercion with cleanup for commas and currency symbols
                     cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
                     numeric = pd.to_numeric(cleaned, errors="coerce")
@@ -651,7 +659,9 @@ class LLMManager:
 - Use proper date/time functions if applicable
  - Columns may include names with spaces (e.g., "primary sales"). When referencing such columns, use double quotes, e.g., "primary sales".
  - Months and years are integers. If the question mentions a quarter (Q1..Q4), map to months: Q1={1,2,3}, Q2={4,5,6}, Q3={7,8,9}, Q4={10,11,12}.
- - Booleans are stored as TRUE/FALSE. For boolean filters, use syntax like stockout = TRUE or productivity = FALSE.
+ - Boolean flags (e.g., productivity, stockout, assortment) are stored as 0/1 integers. Use predicates like column = 1 or column = 0. Avoid TRUE/FALSE.
+ - Do NOT use window functions (e.g., LAG/LEAD) in the WHERE clause. If you need to filter on a window, use QUALIFY or compute in a subquery/CTE and filter in the outer query.
+ - Never use placeholder years like 20XX/XXXX or partial years (e.g., 20). Use actual 4-digit years present in the table. If the year isn't specified, prefer the latest available year for the requested month(s).
 
 ### Dataset information
 - The ONLY table to use is "{table_name_for_prompt}" (use this exact name).
@@ -662,7 +672,7 @@ class LLMManager:
 ### Supported query types
 - Sales/revenue totals and rankings by any dimension.
 - Growth analysis (latest vs previous month; or user-specified periods/quarters).
-- Targets and gaps: target, mto, mro, and their aggregations.
+- Targets and gaps: use mto for "missed target"/"target gap" (do not compute target - sales or target - mro). Use SUM() when ranking totals of sales/mro/mto across groups (avoid MAX for these totals).
 - Productivity/assortment/stockout counts and percentages (COUNT(DISTINCT customer)/total).
 - Time filters: specific months, years, or quarters (Q1..Q4).
 
@@ -703,6 +713,36 @@ FROM {table_name_for_prompt}
 WHERE city = 'lahore'
 GROUP BY region, city
 ORDER BY sales_growth_percentage DESC
+LIMIT 1;
+
+4) Brands with highest stockout percentage in a region for a month:
+SELECT brand,
+  COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
+  COUNT(DISTINCT customer) AS total_shops,
+  (COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS stockout_percentage
+FROM {table_name_for_prompt}
+WHERE region = 'North-A'
+GROUP BY brand
+ORDER BY stockout_percentage DESC
+LIMIT 5;
+
+5) Route with highest missed target (use mto) within filters:
+SELECT route, SUM(mto) AS total_mto
+FROM {table_name_for_prompt}
+WHERE region = 'South-A' AND month = 12 AND year = 2024
+GROUP BY route
+ORDER BY total_mto DESC
+LIMIT 1;
+
+6) Lowest productive area in a region for a month (percentage):
+SELECT area,
+  COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
+  COUNT(DISTINCT customer) AS total_shops,
+  (COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS productivity_percentage
+FROM {table_name_for_prompt}
+WHERE region = 'Central-A'
+GROUP BY area
+ORDER BY productivity_percentage ASC
 LIMIT 1;
 
 ### Write a SQL query to answer the question:
@@ -811,6 +851,61 @@ SELECT"""
         except Exception as e:
             logger.error(f"Error extracting SQL: {e}")
             return None
+
+    def summarize_result(self, nlq: str, df: pd.DataFrame, sql: str, max_rows: int = 30) -> str:
+        """Generate a concise natural-language summary of the query result.
+        Uses the same LLM instance, avoiding reloading a model. Limits the table
+        context to the first N rows to keep prompts short.
+        """
+        try:
+            if not self.model_loaded:
+                return ""
+
+            # Prepare table text
+            display_df = df.head(max_rows)
+            try:
+                table_text = display_df.to_markdown(index=False)  # requires tabulate; falls back below
+            except Exception:
+                table_text = display_df.to_string(index=False)
+
+            prompt = (
+                "### You are a senior data analyst.\n"
+                "Summarize the result of a SQL query clearly and concisely for a business user.\n\n"
+                f"User question:\n{nlq}\n\n"
+                f"SQL used:\n{sql}\n\n"
+                f"Result table (first {min(len(df), max_rows)} rows shown):\n{table_text}\n\n"
+                "Instructions:\n"
+                "- Provide a short, direct answer in 2-4 sentences.\n"
+                "- If ranking/top-N, state the winner(s) and their key value(s).\n"
+                "- If a percentage is present, include it.\n"
+                "- Do not show SQL. Do not invent columns.\n"
+                "- If the result is empty, say no records matched the filters.\n\n"
+                "### Answer:\n"
+            )
+
+            output = self.llm(
+                prompt,
+                temperature=min(0.5, max(0.0, getattr(config.model, "temperature", 0.1))),
+                max_tokens=min(512, max(64, getattr(config.model, "max_tokens", 256))),
+                stop=[
+                    "###",
+                    "\n\n",
+                    "assistant",
+                    "Assistant",
+                    "ASSISTANT",
+                    "User:",
+                    "USER:",
+                    "```",
+                    "<|assistant|>",
+                    "</s>"
+                ]
+            )
+
+            text = output["choices"][0]["text"].strip()
+            return text
+        except Exception as e:
+            logger.warning(f"summarize_result failed: {e}")
+            return ""
     
     def _validate_sql_syntax(self, sql: str) -> bool:
         """Basic SQL syntax validation."""
@@ -892,8 +987,11 @@ class NLQSystem:
             # Enforce semantic column preferences (e.g., prefer "primary sales" when requested)
             sql = self._enforce_semantic_column_preference(nlq, sql, table_name)
             
-            # Apply dynamic time logic (months/years) before caching result
+            # Apply dynamic time logic (months/years) before execution
             sql = self._apply_dynamic_time_logic(nlq, sql, table_name)
+
+            # Enforce domain-specific semantics (mto over target-sales, SUM for totals, boolean normalization, percentages)
+            sql = self._enforce_domain_semantics(nlq, sql, table_name)
 
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
@@ -1143,7 +1241,8 @@ class NLQSystem:
         """Infer metric column from NLQ text with synonyms and fallbacks."""
         try:
             if any(term in nlq_lower for term in [
-                "growth opportunity", "potential improvement", "missed revenue", "missed gain",
+                "growth opportunity", "growth potential", "potential to grow", "potential",
+                "potential improvement", "missed revenue", "missed gain",
                 "untapped potential", "lost earnings", "mro", "opportunity"
             ]):
                 if "mro" in table_cols:
@@ -1176,6 +1275,9 @@ class NLQSystem:
 
             nlq_lower = nlq.lower()
             extracted_year, extracted_months = self._extract_periods_from_nlq(nlq_lower)
+
+            # Normalize invalid year placeholders like 20XX/XXXX or short '20' as early as possible
+            sql = self._normalize_placeholder_years(sql, table_name, extracted_months)
 
             # If SQL already has some time filters, optionally strengthen with missing pieces
             if self._sql_has_time_filters(sql):
@@ -1228,6 +1330,271 @@ class NLQSystem:
             return sql
         except Exception as e:
             logger.warning(f"_apply_dynamic_time_logic failed: {e}")
+            return sql
+
+    def _normalize_placeholder_years(self, sql: str, table_name: str, months_hint: List[int]) -> str:
+        """Replace placeholder years like 20XX/XXXX or partial years (20) in SQL with
+        actual 4-digit years present in the data, preferring the latest year that contains
+        the referenced month(s). If no month is referenced, use the latest year overall.
+        """
+        try:
+            # Detect presence of placeholders
+            placeholder_patterns = [r"\b20XX\b", r"\bXXXX\b", r"\b20\b"]
+            if not any(re.search(pat, sql, flags=re.IGNORECASE) for pat in placeholder_patterns):
+                return sql
+
+            latest_periods = self.db_manager.get_latest_periods(table_name, limit=1)
+            latest_year = latest_periods[0][0] if latest_periods else None
+
+            # If we have a month hint, try to get latest year for that month
+            year_for_month = None
+            if months_hint:
+                try:
+                    year_for_month = self.db_manager.get_latest_year_for_month(table_name, max(months_hint))
+                except Exception:
+                    year_for_month = None
+
+            chosen_year = year_for_month or latest_year
+            if chosen_year is None:
+                return sql
+
+            updated = sql
+            updated = re.sub(r"(?is)\b20XX\b", str(chosen_year), updated)
+            updated = re.sub(r"(?is)\bXXXX\b", str(chosen_year), updated)
+            # Replace bare 'year = 20' patterns only (avoid accidental number replacements)
+            updated = re.sub(r"(?is)(year\s*=\s*)20\b", rf"\g<1>{chosen_year}", updated)
+            return updated
+        except Exception:
+            return sql
+
+    # ---------------- Domain-specific SQL normalization --------------------
+    def _enforce_domain_semantics(self, nlq: str, sql: str, table_name: str) -> str:
+        """Apply domain-specific fixes:
+        - Prefer mto for 'missed target' semantics; avoid target - sales or target - mro
+        - Use SUM() for totals of mro/mto/sales/target when grouping
+        - Normalize boolean predicates to = 1 / = 0
+        - Ensure region filters from NLQ are present in SQL
+        - Add percentage calculations for stockout/productivity when NLQ asks for percent
+        """
+        try:
+            updated = sql
+            table_cols = [c.lower() for c in self.db_manager.table_schemas.get(table_name, {}).get("columns", [])]
+            nlq_lower = nlq.lower()
+
+            # 1) Normalize TRUE/FALSE to 1/0 for boolean-like predicates
+            updated = re.sub(r"(?is)\b=\s*TRUE\b", "= 1", updated)
+            updated = re.sub(r"(?is)\b=\s*FALSE\b", "= 0", updated)
+
+            # 2) Prefer mto for missed target semantics
+            if any(k in nlq_lower for k in ["missed target", "target missed", "target gap", "gap to target", "mto"]):
+                if "mto" in table_cols:
+                    # Replace direct arithmetic patterns with mto
+                    patterns = [
+                        (r"(?is)SUM\s*\(\s*target\s*-\s*sales\s*\)", "SUM(mto)"),
+                        (r"(?is)SUM\s*\(\s*\"primary sales\"\s*-\s*target\s*\)", "SUM(mto)"),
+                        (r"(?is)SUM\s*\(\s*target\s*-\s*\"primary sales\"\s*\)", "SUM(mto)"),
+                        (r"(?is)SUM\s*\(\s*target\s*-\s*mro\s*\)", "SUM(mto)"),
+                        (r"(?is)\btarget\s*-\s*sales\b", "mto"),
+                        (r"(?is)\btarget\s*-\s*mro\b", "mto"),
+                        (r"(?is)SUM\s*\(\s*target\s*\)\s*-\s*SUM\s*\(\s*sales\s*\)", "SUM(mto)"),
+                    ]
+                    for pat, rep in patterns:
+                        updated = re.sub(pat, rep, updated)
+                    # Ensure aggregation alias if ordering by a difference term
+                    updated = re.sub(r"(?is)ORDER\s+BY\s*\((?:[^\)]*target[^\)]*-[^\)]*sales[^\)]*)\)\s*DESC", "ORDER BY SUM(mto) DESC", updated)
+
+                    # Remove unrelated stockout filter if present (common user mistake)
+                    updated = re.sub(r"(?is)\bAND\s+stockout\s*=\s*(1|0)\b", "", updated)
+                    updated = re.sub(r"(?is)\bWHERE\s+stockout\s*=\s*(1|0)\b", "WHERE 1=1", updated)
+
+            # 3) Prefer SUM for totals when grouping
+            if " group by " in updated.lower():
+                for meas in ["mro", "mto", "sales", "target", '"primary sales"']:
+                    updated = re.sub(rf"(?is)\bMAX\s*\(\s*{re.escape(meas)}\s*\)", f"SUM({meas})", updated)
+
+            # 4) Ensure region filter from NLQ present
+            updated = self._ensure_region_filter(nlq, updated)
+
+            # 5) Percentages for stockout/productivity when requested
+            if any(w in nlq_lower for w in ["percent", "percentage", "%", " ratio", " rate"]):
+                # Stockout percentage
+                if "stockout" in updated.lower():
+                    if "stockout_percentage" not in updated.lower():
+                        updated = self._ensure_percentage_for_flag(updated, flag_column="stockout", percent_alias="stockout_percentage")
+                # Productivity percentage
+                if "productivity" in updated.lower():
+                    if "productivity_percentage" not in updated.lower():
+                        updated = self._ensure_percentage_for_flag(updated, flag_column="productivity", percent_alias="productivity_percentage")
+
+            # 6) Window functions should not be in WHERE: move them to QUALIFY
+            if re.search(r"(?is)\bwhere\b.*\bover\s*\(", updated):
+                updated = self._rewrite_window_filters_to_qualify(updated)
+
+            return updated
+        except Exception as e:
+            logger.warning(f"_enforce_domain_semantics failed: {e}")
+            return sql
+
+    def _ensure_percentage_for_flag(self, sql: str, flag_column: str, percent_alias: str) -> str:
+        """Ensure SELECT computes percentage for a 0/1 flag by customer within groups.
+        Adds COUNT(DISTINCT customer) and percentage expression if missing.
+        """
+        try:
+            m_select = re.search(r"(?is)\bselect\b", sql)
+            m_from = re.search(r"(?is)\bfrom\b", sql)
+            if not m_select or not m_from or m_select.end() >= m_from.start():
+                return sql
+            head = sql[:m_select.end()]
+            select_body = sql[m_select.end():m_from.start()].rstrip()
+            tail = sql[m_from.start():]
+
+            # Add total customers if not present
+            if re.search(r"(?is)count\s*\(\s*distinct\s*customer\s*\)\s*as\s*total_\w+", select_body) is None:
+                select_body += ", COUNT(DISTINCT customer) AS total_customers"
+
+            # Add percentage expression
+            percent_expr = (
+                f"(COUNT(DISTINCT CASE WHEN {flag_column} = 1 THEN customer END) * 100.0 / "
+                f"NULLIF(COUNT(DISTINCT customer), 0)) AS {percent_alias}"
+            )
+            if percent_alias.lower() not in select_body.lower():
+                select_body += f", {percent_expr}"
+
+            updated = head + select_body + tail
+            # Prefer ordering by the percentage if ORDER BY references count
+            updated = re.sub(r"(?is)order\s+by\s+\w*stockout\w*_?count\w*\s+(asc|desc)", f"ORDER BY {percent_alias} \\1", updated)
+            return updated
+        except Exception:
+            return sql
+
+    def _ensure_region_filter(self, nlq: str, sql: str) -> str:
+        """Inject region filter into SQL if NLQ mentions a region and SQL lacks a region filter."""
+        try:
+            nlq_lower = nlq.lower()
+            # Match tokens like South-A, North A, Central-A, etc.
+            m = re.search(r"\b(north|south|central)[\-\s]?([ab])\b", nlq_lower)
+            if not m:
+                return sql
+            region = m.group(1).capitalize() + "-" + m.group(2).upper()
+            # If SQL already filters on region, skip
+            if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                return sql
+            # Inject WHERE/AND region = 'X'
+            return self._inject_filter_clause(sql, f"region = '{region}'")
+        except Exception:
+            return sql
+
+    def _inject_filter_clause(self, sql: str, clause: str) -> str:
+        """General-purpose WHERE/AND injection preserving clause order."""
+        try:
+            tokens = [" GROUP BY ", " ORDER BY ", " LIMIT "]
+            lower = sql.lower()
+            insert_pos = len(sql)
+            for token in tokens:
+                pos = lower.find(token.lower())
+                if pos != -1:
+                    insert_pos = min(insert_pos, pos)
+            head = sql[:insert_pos]
+            tail = sql[insert_pos:]
+            if re.search(r"(?is)\bwhere\b", head):
+                head = re.sub(r"(?is)\bwhere\b", "WHERE", head, count=1)
+                head = re.sub(r"(?is)WHERE", f"WHERE {clause} AND", head, count=1)
+            else:
+                head = head.rstrip("; ") + f" WHERE {clause}"
+            return head + tail
+        except Exception:
+            return sql
+
+    def _rewrite_window_filters_to_qualify(self, sql: str) -> str:
+        """Move window function predicates from WHERE to QUALIFY.
+        Splits WHERE conditions on top-level ANDs; conditions containing OVER(...) are moved
+        into a QUALIFY clause. If QUALIFY exists, they are appended with AND.
+        """
+        try:
+            m_where = re.search(r"(?is)\bwhere\b", sql)
+            if not m_where:
+                return sql
+            where_start = m_where.end()
+            # Determine end of WHERE
+            end_tokens = [" GROUP BY ", " HAVING ", " QUALIFY ", " ORDER BY ", " LIMIT ", ";"]
+            lower_sql = sql.lower()
+            where_end = len(sql)
+            for tok in end_tokens:
+                pos = lower_sql.find(tok.lower(), where_start)
+                if pos != -1:
+                    where_end = min(where_end, pos)
+            where_body = sql[where_start:where_end].strip()
+            if not where_body or 'over(' not in where_body.lower():
+                return sql
+
+            # Split conditions by top-level AND
+            def split_top_level_and(expr: str) -> List[str]:
+                parts: List[str] = []
+                buf: List[str] = []
+                depth = 0
+                in_single = False
+                in_double = False
+                i = 0
+                while i < len(expr):
+                    ch = expr[i]
+                    if ch == "'" and not in_double:
+                        in_single = not in_single
+                        buf.append(ch)
+                        i += 1
+                        continue
+                    if ch == '"' and not in_single:
+                        in_double = not in_double
+                        buf.append(ch)
+                        i += 1
+                        continue
+                    if not in_single and not in_double:
+                        if ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth = max(0, depth - 1)
+                        if depth == 0 and expr[i:i+4].lower() == ' and' and (i == 0 or expr[i-1].isspace()):
+                            parts.append(''.join(buf).strip())
+                            buf = []
+                            i += 4
+                            continue
+                    buf.append(ch)
+                    i += 1
+                last = ''.join(buf).strip()
+                if last:
+                    parts.append(last)
+                return [p for p in parts if p]
+
+            conditions = split_top_level_and(where_body)
+            window_conds = [c for c in conditions if ('over(' in c.lower()) or re.search(r"(?is)\b(lag|lead|row_number|rank|dense_rank)\s*\(", c)]
+            non_window_conds = [c for c in conditions if c not in window_conds]
+            if not window_conds:
+                return sql
+
+            before_where = sql[:m_where.start()]
+            after_where = sql[where_end:]
+            new_where = ''
+            if non_window_conds:
+                new_where = 'WHERE ' + ' AND '.join(non_window_conds) + ' '
+
+            # Insert or extend QUALIFY
+            m_qual = re.search(r"(?is)\bqualify\b", after_where)
+            if m_qual:
+                qual_start = m_qual.end()
+                after = after_where[:qual_start] + ' ' + ' AND '.join(window_conds) + after_where[qual_start:]
+                return before_where + new_where + after
+            else:
+                # Place QUALIFY before ORDER BY/LIMIT
+                insert_pos = len(after_where)
+                for tok in [" ORDER BY ", " LIMIT "]:
+                    pos = after_where.lower().find(tok.lower())
+                    if pos != -1:
+                        insert_pos = min(insert_pos, pos)
+                after_head = after_where[:insert_pos]
+                after_tail = after_where[insert_pos:]
+                qualify_str = 'QUALIFY ' + ' AND '.join(window_conds) + ' '
+                return before_where + new_where + after_head + qualify_str + after_tail
+        except Exception as e:
+            logger.warning(f"_rewrite_window_filters_to_qualify failed: {e}")
             return sql
 
     def _is_growth_query(self, nlq_lower: str) -> bool:
@@ -1625,6 +1992,15 @@ def run_query(question: str, table_name: str = "sales_data") -> None:
         else:
             print("No results found.")
         
+        # Textual summary using LLM
+        try:
+            summary = nlq_system.llm_manager.summarize_result(question, result.data, result.sql_query)
+            if summary:
+                print("\n📝 Summary:")
+                print(summary)
+        except Exception as e:
+            logger.debug(f"Summary generation skipped: {e}")
+
         print(f"\n⚡ Performance:")
         print(f"  Execution time: {result.execution_time:.3f}s")
         print(f"  Memory usage: {result.memory_usage_mb:.1f}MB")
