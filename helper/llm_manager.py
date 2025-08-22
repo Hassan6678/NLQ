@@ -94,6 +94,13 @@ class LLMManager:
 {sample_context}
 {stats_context}
 
+### CRITICAL DUCKDB CONSTRAINTS:
+- Use ONLY DuckDB-compatible SQL syntax
+- NEVER use window functions like LAG(), LEAD(), ROW_NUMBER(), RANK(), DENSE_RANK()
+- NEVER use OVER() clauses with PARTITION BY or ORDER BY
+- For growth/trend analysis, use CASE statements with month comparisons instead
+- Use CTEs (WITH clauses) for complex calculations when needed
+
 ### Important guidelines:
 - Use DuckDB SQL syntax
  - The ONLY available table is named "{table_name_for_prompt}". You must use exactly this table name in all FROM and JOIN clauses. Do not invent any other table names.
@@ -189,6 +196,35 @@ WHERE region = 'Central-A'
 GROUP BY area
 ORDER BY productivity_percentage ASC
 LIMIT 1;
+
+7) Region with most growth potential (comparing two months):
+WITH monthly_sales AS (
+    SELECT region, month, SUM(sales) AS total_sales
+    FROM {table_name_for_prompt}
+    WHERE year = 2024
+    GROUP BY region, month
+)
+SELECT region,
+       (SUM(CASE WHEN month = 12 THEN total_sales END) -
+        SUM(CASE WHEN month = 11 THEN total_sales END)) * 100.0 /
+        NULLIF(SUM(CASE WHEN month = 11 THEN total_sales END), 0) AS sales_growth_percentage
+FROM monthly_sales
+GROUP BY region
+ORDER BY sales_growth_percentage DESC
+LIMIT 1;
+
+8) Territory growth analysis (avoiding window functions):
+SELECT territory,
+       SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) AS sales_december,
+       SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) AS sales_november,
+       ((SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) -
+         SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END)) /
+        NULLIF(SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END), 0)) * 100 AS growth_percentage
+FROM {table_name_for_prompt}
+GROUP BY territory
+HAVING SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) > 0
+ORDER BY growth_percentage DESC
+LIMIT 5;
 
 ### Write a SQL query to answer the question:
 # {nlq}

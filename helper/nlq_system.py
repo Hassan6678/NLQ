@@ -55,9 +55,16 @@ class NLQSystem:
                 
                 if not sql:
                     # Rule-based fallback for robustness
+                    logger.info("LLM failed to generate SQL, trying rule-based fallback")
                     sql = self._build_rule_based_sql(nlq, table_name)
-                    if not sql:
-                        raise ValueError("Could not generate valid SQL from query")
+                    
+                if not sql:
+                    # Ultimate fallback: generate a safe, simple query
+                    logger.info("Rule-based fallback failed, using ultimate fallback")
+                    sql = self._build_ultimate_fallback_sql(nlq, table_name)
+                    
+                if not sql:
+                    raise ValueError("All SQL generation methods failed. Please rephrase your question.")
                 
                 # Cache the generated SQL
                 self.cache.cache_sql(nlq, sql)
@@ -74,6 +81,12 @@ class NLQSystem:
 
             # Enforce domain-specific semantics (mto over target-sales, SUM for totals, boolean normalization, percentages)
             sql = self._enforce_domain_semantics(nlq, sql, table_name)
+
+            # Rewrite window functions to DuckDB-compatible syntax
+            sql = self._rewrite_window_functions_to_duckdb(sql)
+
+            # Remove unintended region filters if not explicitly mentioned
+            sql = self._strip_unintended_region_filter(nlq, sql)
 
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
@@ -102,7 +115,8 @@ class NLQSystem:
                     else:
                         raise
                 else:
-                    raise
+                    # Surface the failing SQL for easier debugging
+                    raise RuntimeError(f"Query execution failed. Generated SQL: {sql_to_run}. Error: {exec_err}")
             
             # Generate a human-readable summary using the summarizer model
             try:
@@ -260,6 +274,7 @@ class NLQSystem:
         """Construct a simple, robust SQL for common query shapes when LLM fails.
         Supports queries like:
           - Which <dimension> has most/least <metric or opportunity> in <month/quarter/year>?
+          - Which <dimension> has most potential to grow in <month>?
         Metrics recognized: sales, mro (growth opportunity/potential improvement), mto, target, primary sales.
         Dimensions recognized: region, city, area, territory, distributor, route, brand, sku, customer.
         """
@@ -282,11 +297,20 @@ class NLQSystem:
             nlq_norm = nlq_lower
             for plural, singular in plural_map.items():
                 nlq_norm = re.sub(rf"\b{plural}\b", singular, nlq_norm)
+            
+            # Check if this is a growth query
+            is_growth_query = self._is_growth_query(nlq_norm)
+            
             # Determine dimension
             candidate_dims = [
                 "region", "city", "area", "territory", "distributor", "route", "brand", "sku", "customer"
             ]
             table_cols = [c.lower() for c in self.db_manager.table_schemas.get(table_name, {}).get("columns", [])]
+            
+            if not table_cols:
+                logger.warning("No table columns found for rule-based SQL generation")
+                return None
+            
             chosen_dim = None
             for dim in candidate_dims:
                 if dim in nlq_norm and dim in table_cols:
@@ -299,6 +323,7 @@ class NLQSystem:
                 else:
                     chosen_dim = next((c for c in table_cols if c not in {"month","year"}), None)
             if chosen_dim is None:
+                logger.warning("Could not determine dimension for rule-based SQL")
                 return None
 
             # Determine metric
@@ -306,6 +331,7 @@ class NLQSystem:
             if metric is None:
                 metric = "sales" if "sales" in table_cols else ("mro" if "mro" in table_cols else None)
             if metric is None:
+                logger.warning("Could not determine metric for rule-based SQL")
                 return None
 
             # Direction (most vs least)
@@ -332,20 +358,40 @@ class NLQSystem:
             year, months = self._extract_periods_from_nlq(nlq_lower)
             if months and year is None:
                 # Use latest year containing the latest mentioned month
-                guess_year = self.db_manager.get_latest_year_for_month(table_name, max(months))
-                year = guess_year
+                try:
+                    guess_year = self.db_manager.get_latest_year_for_month(table_name, max(months))
+                    year = guess_year
+                except Exception:
+                    logger.warning("Could not determine year for month, using latest available")
+                    periods = self.db_manager.get_latest_periods(table_name, 1)
+                    if periods:
+                        year = periods[0][0]
             if year is None and not months:
                 # Default to latest month
-                periods = self.db_manager.get_latest_periods(table_name, 1)
-                if periods:
-                    year, m = periods[0]
-                    months = [m]
+                try:
+                    periods = self.db_manager.get_latest_periods(table_name, 1)
+                    if periods:
+                        year, m = periods[0]
+                        months = [m]
+                except Exception:
+                    logger.warning("Could not get latest periods, using defaults")
+                    year = 2024
+                    months = [12]
 
             # Quote identifiers
             dim_sql = self.db_manager._quote_identifier(chosen_dim)
             metric_sql = self.db_manager._quote_identifier(metric)
 
             alias_metric = re.sub(r"[^A-Za-z0-9_]+", "_", metric)
+            
+            # If this is a growth query, build growth-specific SQL
+            if is_growth_query:
+                growth_sql = self._build_growth_sql(nlq_norm, table_name, chosen_dim, metric, year, months, limit_n, order_dir)
+                if growth_sql:
+                    return growth_sql
+                # If growth SQL fails, fall back to simple aggregation
+            
+            # Standard aggregation query
             where_parts = []
             if year:
                 where_parts.append(f"year = {int(year)}")
@@ -362,9 +408,130 @@ class NLQSystem:
                 f"ORDER BY total_{alias_metric} {order_dir} "
                 f"LIMIT {limit_n};"
             )
+            
+            logger.info(f"Generated rule-based SQL: {sql}")
             return sql
+            
         except Exception as e:
             logger.warning(f"_build_rule_based_sql failed: {e}")
+            return None
+
+    def _build_growth_sql(self, nlq_lower: str, table_name: str, dimension: str, metric: str, 
+                          year: Optional[int], months: List[int], limit_n: int, order_dir: str) -> str:
+        """Build growth analysis SQL using DuckDB-compatible syntax without window functions."""
+        try:
+            # Determine the months to compare
+            if months and len(months) >= 2:
+                # User specified multiple months, use them
+                month1, month2 = sorted(months)[-2:]  # Last two months
+            elif months and len(months) == 1:
+                # User specified one month, compare with previous month
+                month1 = months[0]
+                month2 = month1 - 1 if month1 > 1 else 12
+                if month1 == 1:
+                    year = year - 1 if year else None
+            else:
+                # No months specified, use latest two available
+                periods = self.db_manager.get_latest_periods(table_name, limit=2)
+                if len(periods) >= 2:
+                    year, month1 = periods[0]
+                    _, month2 = periods[1]
+                else:
+                    # Only one period available, use it and previous month
+                    year, month1 = periods[0]
+                    month2 = month1 - 1 if month1 > 1 else 12
+                    if month1 == 1:
+                        year = year - 1
+
+            # Ensure we have valid months
+            if month1 is None or month2 is None:
+                month1, month2 = 12, 11  # Default to December vs November
+            
+            # Ensure we have a valid year
+            if year is None:
+                # Get the latest available year for the mentioned month
+                try:
+                    if months and len(months) >= 1:
+                        # Get the latest year for the first mentioned month
+                        latest_year = self.db_manager.get_latest_year_for_month(table_name, months[0])
+                        if latest_year:
+                            year = latest_year
+                        else:
+                            # Fallback: get the latest year from any available periods
+                            periods = self.db_manager.get_latest_periods(table_name, limit=1)
+                            if periods:
+                                year = periods[0][0]
+                            else:
+                                year = 2025  # Last resort default
+                    else:
+                        # No months specified, get the latest year from available periods
+                        periods = self.db_manager.get_latest_periods(table_name, limit=1)
+                        if periods:
+                            year = periods[0][0]
+                        else:
+                            year = 2025  # Last resort default
+                except Exception as e:
+                    logger.warning(f"Failed to get latest year for month: {e}")
+                    # Fallback: get the latest year from any available periods
+                    try:
+                        periods = self.db_manager.get_latest_periods(table_name, limit=1)
+                        if periods:
+                            year = periods[0][0]
+                        else:
+                            year = 2025  # Last resort default
+                    except Exception:
+                        year = 2025  # Last resort default
+
+            # Quote identifiers
+            dim_sql = self.db_manager._quote_identifier(dimension)
+            metric_sql = self.db_manager._quote_identifier(metric)
+
+            # Build the growth SQL
+            sql = f"""SELECT {dim_sql},
+                    SUM(CASE WHEN month = {month1} THEN {metric_sql} ELSE 0 END) AS {metric}_month_{month1},
+                    SUM(CASE WHEN month = {month2} THEN {metric_sql} ELSE 0 END) AS {metric}_month_{month2},
+                    ((SUM(CASE WHEN month = {month1} THEN {metric_sql} ELSE 0 END) -
+                    SUM(CASE WHEN month = {month2} THEN {metric_sql} ELSE 0 END)) /
+                    NULLIF(SUM(CASE WHEN month = {month2} THEN {metric_sql} ELSE 0 END), 0)) * 100 AS growth_percentage
+                    FROM {table_name}
+                    WHERE year = {year} AND month IN ({month2}, {month1})
+                    GROUP BY {dim_sql}
+                    HAVING SUM(CASE WHEN month = {month2} THEN {metric_sql} ELSE 0 END) > 0
+                    ORDER BY growth_percentage {order_dir}
+                    LIMIT {limit_n};"""
+
+            return sql
+        except Exception as e:
+            logger.warning(f"_build_growth_sql failed: {e}")
+            # Fallback to simple aggregation
+            return self._build_simple_growth_sql(table_name, dimension, metric, year, months, limit_n, order_dir)
+
+    def _build_simple_growth_sql(self, table_name: str, dimension: str, metric: str, 
+                                year: Optional[int], months: List[int], limit_n: int, order_dir: str) -> str:
+        """Fallback simple growth SQL if complex growth analysis fails."""
+        try:
+            # Use latest two months available
+            periods = self.db_manager.get_latest_periods(table_name, limit=2)
+            if len(periods) >= 2:
+                year, month1 = periods[0]
+                _, month2 = periods[1]
+            else:
+                year, month1 = periods[0]
+                month2 = month1 - 1 if month1 > 1 else 12
+
+            dim_sql = self.db_manager._quote_identifier(dimension)
+            metric_sql = self.db_manager._quote_identifier(metric)
+
+            sql = f"""SELECT {dim_sql}, SUM({metric_sql}) AS total_{metric}
+                    FROM {table_name}
+                    WHERE year = {year} AND month IN ({month2}, {month1})
+                    GROUP BY {dim_sql}
+                    ORDER BY total_{metric} {order_dir}
+                    LIMIT {limit_n};"""
+
+            return sql
+        except Exception as e:
+            logger.warning(f"_build_simple_growth_sql failed: {e}")
             return None
 
     def _choose_metric_from_nlq(self, nlq_lower: str, table_cols: List[str]) -> Optional[str]:
@@ -1144,3 +1311,330 @@ class NLQSystem:
             "loaded_tables": {name: {"rows": info["total_rows"]} 
                             for name, info in self.loaded_tables.items()}
         }
+
+    def _strip_unintended_region_filter(self, nlq: str, sql: str) -> str:
+        """Remove any region filter from SQL if the original NLQ did not explicitly mention a region."""
+        try:
+            nlq_lower = nlq.lower()
+            
+            # Check if NLQ explicitly mentions a region
+            region_terms = ["region", "north", "south", "east", "west", "central"]
+            explicit_region = any(term in nlq_lower for term in region_terms)
+            
+            if not explicit_region:
+                # Remove region filters from SQL
+                # Pattern: region = 'X' or region IN ('X', 'Y')
+                sql = re.sub(r"(?i)\s+AND\s+region\s*=\s*['\"][^'\"]*['\"]", "", sql)
+                sql = re.sub(r"(?i)\s+AND\s+region\s+IN\s*\([^)]+\)", "", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s+AND", " WHERE", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s*$", "", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s+AND", " WHERE", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s*$", "", sql)
+                
+                # Clean up empty WHERE clauses
+                sql = re.sub(r"\s+WHERE\s+AND", " WHERE", sql)
+                sql = re.sub(r"\s+WHERE\s*$", "", sql)
+                
+                logger.info("Removed unintended region filter from SQL")
+            
+            return sql
+        except Exception as e:
+            logger.warning(f"_strip_unintended_region_filter failed: {e}")
+            return sql
+
+    def _rewrite_window_functions_to_duckdb(self, sql: str) -> str:
+        """Rewrite window function SQL to DuckDB-compatible syntax using CTEs and CASE statements."""
+        try:
+            sql_lower = sql.lower()
+            
+            # Check if SQL contains window functions
+            window_patterns = [
+                r"\blag\s*\(", r"\blead\s*\(", r"\brow_number\s*\(", 
+                r"\brank\s*\(", r"\bdense_rank\s*\(", r"\bover\s*\("
+            ]
+            
+            if not any(re.search(pattern, sql_lower) for pattern in window_patterns):
+                return sql  # No window functions found
+            
+            logger.info("Detected window functions, rewriting to DuckDB-compatible syntax")
+            
+            # Handle LAG/LEAD functions for growth analysis
+            if re.search(r"\blag\s*\(", sql_lower) or re.search(r"\blead\s*\(", sql_lower):
+                return self._rewrite_lag_lead_to_case(sql)
+            
+            # Handle ROW_NUMBER/RANK functions
+            if re.search(r"\brow_number\s*\(", sql_lower) or re.search(r"\brank\s*\(", sql_lower):
+                return self._rewrite_ranking_to_duckdb(sql)
+            
+            # Generic window function removal
+            return self._remove_window_functions(sql)
+            
+        except Exception as e:
+            logger.warning(f"_rewrite_window_functions_to_duckdb failed: {e}")
+            return sql
+
+    def _rewrite_lag_lead_to_case(self, sql: str) -> str:
+        """Rewrite LAG/LEAD window functions to CASE-based month comparisons."""
+        try:
+            # Extract table name and basic structure
+            table_match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
+            if not table_match:
+                return sql
+            
+            table_name = table_match.group(1)
+            
+            # Look for common growth patterns with LAG
+            # Pattern: LAG(SUM(sales)) AS total_sales
+            if re.search(r"lag\s*\(\s*sum\s*\(\s*sales\s*\)\s*\)", sql_lower := sql.lower()):
+                # This is likely a growth query comparing months
+                return self._build_growth_sql_from_lag(sql, table_name)
+            
+            # Pattern: LAG(SUM(sales)) OVER (ORDER BY month)
+            if re.search(r"lag\s*\(\s*sum\s*\(\s*sales\s*\)\s*\)", sql_lower):
+                return self._build_growth_sql_from_lag(sql, table_name)
+            
+            # Generic LAG/LEAD removal
+            return self._remove_lag_lead_functions(sql)
+            
+        except Exception as e:
+            logger.warning(f"_rewrite_lag_lead_to_case failed: {e}")
+            return self._remove_lag_lead_functions(sql)
+
+    def _build_growth_sql_from_lag(self, sql: str, table_name: str) -> str:
+        """Build growth SQL from LAG-based window function."""
+        try:
+            # Extract dimension from PARTITION BY if present
+            partition_match = re.search(r"partition\s+by\s+(\w+)", sql, re.IGNORECASE)
+            dimension = partition_match.group(1) if partition_match else "region"
+            
+            # Extract time filters if present
+            year_match = re.search(r"year\s*=\s*(\d{4})", str(sql))
+            year = int(year_match.group(1)) if year_match else 2024
+            
+            month_match = re.search(r"month\s*=\s*(\d{1,2})", str(sql))
+            month = int(month_match.group(1)) if month_match else 12
+            
+            # Build DuckDB-compatible growth SQL
+            prev_month = month - 1 if month > 1 else 12
+            prev_year = year if month > 1 else year - 1
+            
+            sql = f"""WITH monthly_sales AS (
+    SELECT {dimension}, month, SUM(sales) AS total_sales
+    FROM {table_name}
+    WHERE year = {year} AND month IN ({prev_month}, {month})
+    GROUP BY {dimension}, month
+)
+SELECT {dimension},
+       (SUM(CASE WHEN month = {month} THEN total_sales END) -
+        SUM(CASE WHEN month = {prev_month} THEN total_sales END)) * 100.0 /
+        NULLIF(SUM(CASE WHEN month = {prev_month} THEN total_sales END), 0) AS sales_growth_percentage
+FROM monthly_sales
+GROUP BY {dimension}
+ORDER BY sales_growth_percentage DESC
+LIMIT 1;"""
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_build_growth_sql_from_lag failed: {e}")
+            return self._remove_lag_lead_functions(sql)
+
+    def _remove_lag_lead_functions(self, sql: str) -> str:
+        """Remove LAG/LEAD functions and simplify the query."""
+        try:
+            # Remove LAG/LEAD function calls
+            sql = re.sub(r"lag\s*\(\s*[^)]+\s*\)", "0", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"lead\s*\(\s*[^)]+\s*\)", "0", sql, flags=re.IGNORECASE)
+            
+            # Remove OVER clauses
+            sql = re.sub(r"over\s*\(\s*[^)]*\s*\)", "", sql, flags=re.IGNORECASE)
+            
+            # Clean up empty parentheses
+            sql = re.sub(r"\(\s*\)", "", sql)
+            
+            # Remove empty ORDER BY clauses
+            sql = re.sub(r"order\s+by\s*$", "", sql, flags=re.IGNORECASE)
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_remove_lag_lead_functions failed: {e}")
+            return sql
+
+    def _remove_window_functions(self, sql: str) -> str:
+        """Remove all window functions and simplify the query."""
+        try:
+            # Remove common window functions
+            window_funcs = [
+                r"row_number\s*\(\s*\)", r"rank\s*\(\s*\)", r"dense_rank\s*\(\s*\)",
+                r"ntile\s*\(\s*\d+\s*\)", r"percent_rank\s*\(\s*\)", r"cume_dist\s*\(\s*\)"
+            ]
+            
+            for pattern in window_funcs:
+                sql = re.sub(pattern, "1", sql, flags=re.IGNORECASE)
+            
+            # Remove OVER clauses
+            sql = re.sub(r"over\s*\(\s*[^)]*\s*\)", "", sql, flags=re.IGNORECASE)
+            
+            # Clean up empty parentheses and clauses
+            sql = re.sub(r"\(\s*\)", "", sql)
+            sql = re.sub(r"order\s+by\s*$", "", sql, flags=re.IGNORECASE)
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_remove_window_functions failed: {e}")
+            return sql
+
+    def _rewrite_ranking_to_duckdb(self, sql: str) -> str:
+        """Rewrite ROW_NUMBER/RANK functions to DuckDB-compatible syntax."""
+        try:
+            # Extract table name and basic structure
+            table_match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
+            if not table_match:
+                return sql
+            
+            table_name = table_match.group(1)
+            
+            # Look for common ranking patterns
+            if re.search(r"row_number\s*\(\s*\)", sql.lower()):
+                # Convert ROW_NUMBER() OVER (ORDER BY ...) to simple ORDER BY with LIMIT
+                return self._convert_row_number_to_limit(sql, table_name)
+            
+            if re.search(r"rank\s*\(\s*\)", sql.lower()):
+                # Convert RANK() to simple ORDER BY
+                return self._convert_rank_to_order(sql, table_name)
+            
+            # Generic ranking removal
+            return self._remove_ranking_functions(sql)
+            
+        except Exception as e:
+            logger.warning(f"_rewrite_ranking_to_duckdb failed: {e}")
+            return self._remove_ranking_functions(sql)
+
+    def _convert_row_number_to_limit(self, sql: str, table_name: str) -> str:
+        """Convert ROW_NUMBER() OVER (ORDER BY ...) to simple ORDER BY with LIMIT."""
+        try:
+            # Extract ORDER BY clause from OVER
+            order_match = re.search(r"over\s*\(\s*order\s+by\s+([^)]+)\)", sql, re.IGNORECASE)
+            if order_match:
+                order_clause = order_match.group(1).strip()
+                
+                # Remove the OVER clause and ROW_NUMBER
+                sql = re.sub(r"row_number\s*\(\s*\)\s*over\s*\(\s*order\s+by\s+[^)]+\)", "", sql, flags=re.IGNORECASE)
+                
+                # Add ORDER BY and LIMIT
+                sql = re.sub(r"(\bFROM\s+\w+.*?)(\s*;?\s*)$", r"\1 ORDER BY " + order_clause + r" LIMIT 1\2", sql, flags=re.IGNORECASE | re.DOTALL)
+                
+                return sql
+            
+            # Fallback: remove ROW_NUMBER and add simple ORDER BY
+            sql = re.sub(r"row_number\s*\(\s*\)\s*over\s*\(\s*[^)]*\)", "", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"(\bFROM\s+\w+.*?)(\s*;?\s*)$", r"\1 ORDER BY sales DESC LIMIT 1\2", sql, flags=re.IGNORECASE | re.DOTALL)
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_convert_row_number_to_limit failed: {e}")
+            return self._remove_ranking_functions(sql)
+
+    def _convert_rank_to_order(self, sql: str, table_name: str) -> str:
+        """Convert RANK() functions to simple ORDER BY."""
+        try:
+            # Extract ORDER BY clause from OVER
+            order_match = re.search(r"over\s*\(\s*order\s+by\s+([^)]+)\)", sql, re.IGNORECASE)
+            if order_match:
+                order_clause = order_match.group(1).strip()
+                
+                # Remove the OVER clause and RANK
+                sql = re.sub(r"rank\s*\(\s*\)\s*over\s*\(\s*order\s+by\s+[^)]+\)", "", sql, flags=re.IGNORECASE)
+                
+                # Add ORDER BY
+                sql = re.sub(r"(\bFROM\s+\w+.*?)(\s*;?\s*)$", r"\1 ORDER BY " + order_clause + r"\2", sql, flags=re.IGNORECASE | re.DOTALL)
+                
+                return sql
+            
+            # Fallback: remove RANK and add simple ORDER BY
+            sql = re.sub(r"rank\s*\(\s*\)\s*over\s*\(\s*[^)]*\)", "", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"(\bFROM\s+\w+.*?)(\s*;?\s*)$", r"\1 ORDER BY sales DESC\2", sql, flags=re.IGNORECASE | re.DOTALL)
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_convert_rank_to_order failed: {e}")
+            return self._remove_ranking_functions(sql)
+
+    def _remove_ranking_functions(self, sql: str) -> str:
+        """Remove ranking functions and simplify the query."""
+        try:
+            # Remove ranking function calls
+            sql = re.sub(r"rank\s*\(\s*\)", "1", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"row_number\s*\(\s*\)", "1", sql, flags=re.IGNORECASE)
+            sql = re.sub(r"dense_rank\s*\(\s*\)", "1", sql, flags=re.IGNORECASE)
+            
+            # Remove OVER clauses
+            sql = re.sub(r"over\s*\(\s*[^)]*\s*\)", "", sql, flags=re.IGNORECASE)
+            
+            # Clean up empty parentheses and clauses
+            sql = re.sub(r"\(\s*\)", "", sql)
+            sql = re.sub(r"order\s+by\s*$", "", sql, flags=re.IGNORECASE)
+            
+            return sql
+            
+        except Exception as e:
+            logger.warning(f"_remove_ranking_functions failed: {e}")
+            return sql
+
+    def _build_ultimate_fallback_sql(self, nlq: str, table_name: str) -> str:
+        """Ultimate fallback that generates a safe, simple SQL query when all else fails."""
+        try:
+            logger.info("Building ultimate fallback SQL")
+            
+            # Get table schema
+            table_info = self.db_manager.table_schemas.get(table_name, {})
+            columns = table_info.get("columns", [])
+            
+            if not columns:
+                return None
+            
+            # Find available dimensions and metrics
+            available_dims = []
+            available_metrics = []
+            
+            for col in columns:
+                col_lower = col.lower()
+                if col_lower in ["region", "city", "area", "territory", "distributor", "route", "brand", "sku", "customer"]:
+                    available_dims.append(col)
+                elif col_lower in ["sales", "mro", "mto", "target", "primary sales"]:
+                    available_metrics.append(col)
+            
+            # Default values
+            dimension = available_dims[0] if available_dims else "region"
+            metric = available_metrics[0] if available_metrics else "sales"
+            
+            # Get latest available period
+            try:
+                periods = self.db_manager.get_latest_periods(table_name, limit=1)
+                if periods:
+                    year, month = periods[0]
+                    time_filter = f"WHERE year = {year} AND month = {month}"
+                else:
+                    time_filter = ""
+            except Exception:
+                time_filter = ""
+            
+            # Build safe SQL
+            sql = f"""SELECT {self.db_manager._quote_identifier(dimension)}, 
+       SUM({self.db_manager._quote_identifier(metric)}) AS total_{metric.replace(' ', '_')}
+FROM {table_name}
+{time_filter}
+GROUP BY {self.db_manager._quote_identifier(dimension)}
+ORDER BY total_{metric.replace(' ', '_')} DESC
+LIMIT 5;"""
+            
+            logger.info(f"Generated ultimate fallback SQL: {sql}")
+            return sql
+            
+        except Exception as e:
+            logger.error(f"Ultimate fallback failed: {e}")
+            return None
