@@ -14,7 +14,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import your existing NLQ system
-from main import initialize_system, NLQSystem, QueryResult
+from main import initialize_system, NLQSystem
+from helper.types import QueryResult
 
 # Page configuration
 st.set_page_config(
@@ -250,6 +251,11 @@ def display_query_result(result: QueryResult, query_text: str):
             )
     else:
         st.info("📭 No results found for this query.")
+
+    # Textual summary (human language)
+    if getattr(result, 'summary_text', ""):
+        st.markdown("#### 📝 Summary")
+        st.write(result.summary_text)
 
 def main():
     """Main Streamlit application."""
