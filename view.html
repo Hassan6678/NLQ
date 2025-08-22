@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chat CPG</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f8f9fb;
+      color: #333;
+      display: flex;
+      height: 100vh;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 220px;
+      background: #f1f3f7;
+      border-right: 1px solid #ddd;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .sidebar h3 {
+      font-size: 14px;
+      margin: 0;
+      color: #555;
+      display: flex;
+      align-items: center;
+    }
+    .sidebar h3::before {
+      content: "📝";
+      margin-right: 8px;
+    }
+
+    /* Main Chat Area */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 40px;
+    }
+    .main h1 {
+      display: flex;
+      align-items: center;
+      font-size: 28px;
+      margin: 0 0 15px 0;
+    }
+    .main h1::before {
+      content: "💬";
+      margin-right: 10px;
+      font-size: 28px;
+    }
+    .message {
+      background: #fff7e6;
+      border: 1px solid #ffd580;
+      color: #444;
+      padding: 12px 16px;
+      border-radius: 6px;
+      display: inline-block;
+      font-size: 14px;
+    }
+
+    /* Input */
+    .chat-input {
+      margin-top: auto;
+      display: flex;
+      border-top: 1px solid #ddd;
+      padding: 10px;
+      background: #f9f9f9;
+    }
+    .chat-input input {
+      flex: 1;
+      border: none;
+      padding: 12px;
+      font-size: 14px;
+      outline: none;
+      border-radius: 6px;
+      background: #f0f0f0;
+    }
+    .chat-input button {
+      background: none;
+      border: none;
+      font-size: 18px;
+      margin-left: 10px;
+      cursor: pointer;
+      color: #777;
+    }
+  </style>
+</head>
+<body>
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <h3>Recent Queries</h3>
+  </div>
+
+  <!-- Main Area -->
+  <div class="main">
+    <h1>Chat CPG</h1>
+    <div class="message">📦 Do you need help? I'm here to assist you.</div>
+
+    <!-- Input -->
+    <div class="chat-input">
+      <input type="text" placeholder="Type your message and press Enter...">
+      <button>&#10148;</button>
+    </div>
+  </div>
+</body>
+</html>
