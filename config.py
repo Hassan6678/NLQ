@@ -26,12 +26,15 @@ class DatabaseConfig:
 class ModelConfig:
     """LLM model configuration settings."""
     model_path: str = "models/llama-3-sqlcoder-8b.Q6_K.gguf"
+    summarizer_model_path: str = "models/Mistral-7B-Instruct-v0.1.Q6_K.gguf"
     n_ctx: int = 2048
     n_threads: int = 6
     n_gpu_layers: int = 20
     temperature: float = 0.0
     max_tokens: int = 512
     verbose: bool = False
+    summarizer_temperature: float = 0.2
+    summarizer_max_tokens: int = 384
 
 
 @dataclass
@@ -116,6 +119,8 @@ class Config:
         # Model settings
         if os.getenv("MODEL_PATH"):
             self.model.model_path = os.getenv("MODEL_PATH")
+        if os.getenv("SUMMARIZER_MODEL_PATH"):
+            self.model.summarizer_model_path = os.getenv("SUMMARIZER_MODEL_PATH")
         if os.getenv("MODEL_N_CTX"):
             self.model.n_ctx = int(os.getenv("MODEL_N_CTX"))
         if os.getenv("MODEL_N_GPU_LAYERS"):
@@ -197,9 +202,13 @@ class Config:
         """Validate configuration settings."""
         errors = []
         
-        # Check if model file exists
+        # Check if SQL model file exists
         if not os.path.exists(self.model.model_path):
             errors.append(f"Model file not found: {self.model.model_path}")
+        # Summarizer model is recommended; warn if missing but do not fail validation
+        if not os.path.exists(self.model.summarizer_model_path):
+            print(f"Warning: Summarizer model not found: {self.model.summarizer_model_path}. "
+                  f"Will fallback to SQL model for summaries.")
         
         # Check memory limits
         memory_info = self.get_memory_info()
