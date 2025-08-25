@@ -769,16 +769,47 @@ class NLQSystem:
         """Inject region filter into SQL if NLQ mentions a region and SQL lacks a region filter."""
         try:
             nlq_lower = nlq.lower()
-            # Match tokens like South-A, North A, Central-A, etc.
-            m = re.search(r"\b(north|south|central)[\-\s]?([ab])\b", nlq_lower)
-            if not m:
-                return sql
-            region = m.group(1).capitalize() + "-" + m.group(2).upper()
-            # If SQL already filters on region, skip
-            if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
-                return sql
-            # Inject WHERE/AND region = 'X'
-            return self._inject_filter_clause(sql, f"region = '{region}'")
+            
+            # Enhanced region detection patterns
+            # 1. Exact match: Central-A, North B, South-A, etc.
+            exact_match = re.search(r"\b(north|south|central|east|west)[\-\s]?([ab])\b", nlq_lower)
+            if exact_match:
+                region = exact_match.group(1).capitalize() + "-" + exact_match.group(2).upper()
+                # If SQL already filters on region, skip
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                # Inject exact region filter
+                return self._inject_filter_clause(sql, f"region = '{region}'")
+            
+            # 2. Partial match: Central, North, South, etc. (without A/B suffix)
+            partial_match = re.search(r"\b(north|south|central|east|west)\b", nlq_lower)
+            if partial_match:
+                region_base = partial_match.group(1).capitalize()
+                # If SQL already filters on region, skip
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                # Use LIKE operator for partial matching (DuckDB compatible)
+                # This will match Central-A, Central-B, Central-C, etc.
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            # 3. Additional patterns for more flexible matching
+            # Handle "Central region", "North area", etc.
+            region_with_context = re.search(r"\b(north|south|central|east|west)\s+(region|area|territory)\b", nlq_lower)
+            if region_with_context:
+                region_base = region_with_context.group(1).capitalize()
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            # 4. Handle abbreviated forms: "Central reg", "North reg", etc.
+            region_abbrev = re.search(r"\b(north|south|central|east|west)\s+reg\b", nlq_lower)
+            if region_abbrev:
+                region_base = region_abbrev.group(1).capitalize()
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            return sql
         except Exception:
             return sql
 
@@ -787,7 +818,16 @@ class NLQSystem:
         try:
             nlq_lower = nlq.lower()
             # If NLQ mentions region, do nothing
-            if re.search(r"\b(north|south|central)[\-\s]?([ab])\b", nlq_lower):
+            if re.search(r"\b(north|south|central|east|west)[\-\s]?([ab])\b", nlq_lower):
+                return sql
+            # Also check for partial region mentions
+            if re.search(r"\b(north|south|central|east|west)\b", nlq_lower):
+                return sql
+            # Check for region with context
+            if re.search(r"\b(north|south|central|east|west)\s+(region|area|territory)\b", nlq_lower):
+                return sql
+            # Check for abbreviated forms
+            if re.search(r"\b(north|south|central|east|west)\s+reg\b", nlq_lower):
                 return sql
 
             # If no WHERE present, nothing to do
@@ -846,11 +886,13 @@ class NLQSystem:
                 return [p for p in parts if p]
 
             conditions = split_top_level_and(where_body)
-            # Identify region conditions
+            # Identify region conditions (including LIKE patterns)
             region_conds = []
             keep_conds = []
             for c in conditions:
-                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", c) or re.search(r"(?is)\bregion\s+in\s*\([^)]+\)", c):
+                if (re.search(r"(?is)\bregion\s*=\s*'[^']+'", c) or 
+                    re.search(r"(?is)\bregion\s+in\s*\([^)]+\)", c) or
+                    re.search(r"(?is)\bregion\s+like\s*'[^']+'", c)):
                     region_conds.append(c)
                 else:
                     keep_conds.append(c)
@@ -1322,14 +1364,17 @@ class NLQSystem:
             explicit_region = any(term in nlq_lower for term in region_terms)
             
             if not explicit_region:
-                # Remove region filters from SQL
-                # Pattern: region = 'X' or region IN ('X', 'Y')
+                # Remove region filters from SQL (including LIKE patterns)
+                # Pattern: region = 'X' or region IN ('X', 'Y') or region LIKE 'X%'
                 sql = re.sub(r"(?i)\s+AND\s+region\s*=\s*['\"][^'\"]*['\"]", "", sql)
                 sql = re.sub(r"(?i)\s+AND\s+region\s+IN\s*\([^)]+\)", "", sql)
+                sql = re.sub(r"(?i)\s+AND\s+region\s+LIKE\s*['\"][^'\"]*['\"]", "", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s+AND", " WHERE", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s*$", "", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s+AND", " WHERE", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s*$", "", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+LIKE\s*['\"][^'\"]*['\"]\s+AND", " WHERE", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+LIKE\s*['\"][^'\"]*['\"]\s*$", "", sql)
                 
                 # Clean up empty WHERE clauses
                 sql = re.sub(r"\s+WHERE\s+AND", " WHERE", sql)

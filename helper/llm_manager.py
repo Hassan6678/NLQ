@@ -114,6 +114,7 @@ class LLMManager:
  - Do NOT use window functions (e.g., LAG/LEAD) in the WHERE clause. If you need to filter on a window, use QUALIFY or compute in a subquery/CTE and filter in the outer query.
  - Never use placeholder years like 20XX/XXXX or partial years (e.g., 20). Use actual 4-digit years present in the table. If the year isn't specified, prefer the latest available year for the requested month(s).
  - Do NOT add region/city/area/territory/distributor/route filters unless explicitly mentioned in the user's question.
+ - For region filtering: If the user mentions a region without specifying the exact suffix (e.g., "Central" instead of "Central-A"), use LIKE operator: `region LIKE 'Central-%'` to match all Central variants (Central-A, Central-B, Central-C, etc.).
 
 ### Dataset information
 - The ONLY table to use is "{table_name_for_prompt}" (use this exact name).
@@ -186,13 +187,13 @@ GROUP BY route
 ORDER BY total_mto DESC
 LIMIT 1;
 
-6) Lowest productive area in a region for a month (percentage):
+6) Lowest productive area in Central region for a month (partial region match):
 SELECT area,
   COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
   COUNT(DISTINCT customer) AS total_shops,
   (COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS productivity_percentage
 FROM {table_name_for_prompt}
-WHERE region = 'Central-A'
+WHERE region LIKE 'Central-%'
 GROUP BY area
 ORDER BY productivity_percentage ASC
 LIMIT 1;
