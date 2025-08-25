@@ -1,4 +1,5 @@
 import time
+import os
 import re
 import logging
 from typing import List, Optional, Tuple, Dict, Any
@@ -24,6 +25,55 @@ class NLQSystem:
         self.loaded_tables = {}
         
         logger.info("NLQ System initialized successfully")
+
+    # ---------------- Persistence helpers -----------------
+    def fast_attach_existing(self, table_name: str = "sales_data") -> bool:
+        """Attempt to attach already materialized table from existing DuckDB file without reloading raw data.
+        Returns True if table metadata prepared (table exists) else False."""
+        if self.db_manager.table_exists(table_name):
+            if self.db_manager.load_existing_table_schema(table_name):
+                row_count = self.db_manager.get_table_row_count(table_name)
+                self.loaded_tables[table_name] = {
+                    "table_name": table_name,
+                    "total_rows": row_count,
+                    "duration": 0.0,
+                    "chunks_processed": 0,
+                    "schema": self.db_manager.table_schemas.get(table_name, {})
+                }
+                logger.info(f"Attached existing table '{table_name}' ({row_count:,} rows) from persisted DB")
+                return True
+        return False
+
+    def delete_database(self) -> bool:
+        """Close connections and delete DuckDB file for a clean rebuild."""
+        try:
+            path = config.database.db_path
+            self.db_manager.close_all()
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"Deleted database file: {path}")
+            # Re-init pool
+            self.db_manager._initialize_connections()
+            self.loaded_tables.clear()
+            self.cache.query_cache.clear()
+            return True
+        except Exception as e:
+            logger.error(f"delete_database failed: {e}")
+            return False
+
+    def reset_table(self, table_name: str = "sales_data") -> bool:
+        """Drop a single table and metadata (keeping DB)."""
+        try:
+            if not self.db_manager.table_exists(table_name):
+                return True
+            with self.db_manager.get_connection() as conn:
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            self.loaded_tables.pop(table_name, None)
+            self.db_manager.table_schemas.pop(table_name, None)
+            return True
+        except Exception as e:
+            logger.warning(f"reset_table failed: {e}")
+            return False
     
     def load_data(self, file_path: str, table_name: str = "sales_data") -> Dict[str, Any]:
         """Load data file with optimized processing."""

@@ -535,6 +535,8 @@
       <button id="loadDatasetBtn" class="btn btn-success" disabled>
         Load Dataset
       </button>
+  <button id="refreshTableBtn" class="btn btn-primary" disabled>Refresh Table</button>
+  <button id="deleteDbBtn" class="btn btn-warning" disabled>Delete DB</button>
     </div>
 
     <div class="control-section">
@@ -589,6 +591,8 @@
       initEventListeners() {
         document.getElementById('initBtn').addEventListener('click', () => this.initializeSystem());
         document.getElementById('loadDatasetBtn').addEventListener('click', () => this.loadDataset());
+  document.getElementById('refreshTableBtn').addEventListener('click', () => this.refreshTable());
+  document.getElementById('deleteDbBtn').addEventListener('click', () => this.deleteDb());
         document.getElementById('clearHistoryBtn').addEventListener('click', () => this.clearHistory());
         document.getElementById('sendBtn').addEventListener('click', () => this.sendQuery());
         document.getElementById('queryInput').addEventListener('keypress', (e) => {
@@ -636,7 +640,7 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              dataset_path: 'data/llm_dataset_v10.gz',
+              dataset_path: 'data/llm_dataset_v11.gz',
               table_name: 'sales_data'
             })
           });
@@ -654,6 +658,51 @@
           this.showToast(`Error: ${error.message}`, 'error', 4500);
         } finally {
           btn.innerHTML = originalText;
+          btn.disabled = false;
+        }
+      }
+
+      async refreshTable() {
+        if (!this.datasetLoaded) return;
+        const btn = document.getElementById('refreshTableBtn');
+        const original = btn.innerHTML;
+        btn.innerHTML = '<span class="loading"></span>Refreshing...';
+        btn.disabled = true;
+        try {
+          const response = await fetch('/api/refresh_table', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dataset_path:'data/llm_dataset_v11.gz', table_name:'sales_data'})});
+          const data = await response.json();
+          if (data.success) {
+            this.showToast('Table refreshed', 'success', 3000);
+          } else {
+            this.showToast('Refresh failed: '+data.message, 'error', 4000);
+          }
+        } catch (e) {
+          this.showToast('Refresh error: '+e.message, 'error', 4000);
+        } finally {
+          btn.innerHTML = original;
+          btn.disabled = false;
+        }
+      }
+
+      async deleteDb() {
+        const btn = document.getElementById('deleteDbBtn');
+        const original = btn.innerHTML;
+        btn.innerHTML = '<span class="loading"></span>Deleting...';
+        btn.disabled = true;
+        try {
+          const response = await fetch('/api/delete_db', {method:'POST'});
+            const data = await response.json();
+            if (data.success) {
+              this.showToast('Database deleted. Reload dataset to rebuild.', 'warning', 4000);
+              this.datasetLoaded = false;
+              this.updateUI();
+            } else {
+              this.showToast('Delete failed: '+data.message, 'error', 4000);
+            }
+        } catch (e) {
+          this.showToast('Delete error: '+e.message, 'error', 4000);
+        } finally {
+          btn.innerHTML = original;
           btn.disabled = false;
         }
       }
@@ -916,6 +965,8 @@
       updateUI() {
         const initBtn = document.getElementById('initBtn');
         const loadDatasetBtn = document.getElementById('loadDatasetBtn');
+  const refreshBtn = document.getElementById('refreshTableBtn');
+  const deleteBtn = document.getElementById('deleteDbBtn');
         const queryInput = document.getElementById('queryInput');
         const sendBtn = document.getElementById('sendBtn');
         const clearHistoryBtn = document.getElementById('clearHistoryBtn');
@@ -932,14 +983,19 @@
           initBtn.innerHTML = '<span class="status-indicator status-active"></span>System Ready';
           initBtn.disabled = true;
           loadDatasetBtn.disabled = false;
+          deleteBtn.disabled = false; // allow delete before load to clear old file
         }
         
         if (this.datasetLoaded) {
           loadDatasetBtn.innerHTML = 'Dataset Loaded';
           loadDatasetBtn.disabled = true;
+          refreshBtn.disabled = false;
+          deleteBtn.disabled = false;
           queryInput.disabled = false;
           sendBtn.disabled = false;
           clearHistoryBtn.disabled = false;
+        } else {
+          refreshBtn.disabled = true;
         }
       }
 

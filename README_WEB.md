@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 Place your dataset file in the `data/` directory:
 - Supported formats: CSV, GZ compressed CSV
-- Default path: `data/llm_dataset_v10.gz`
+- Default path: `data/llm_dataset_v11.gz`
 - Table name: `sales_data` (configurable)
 
 ### 3. Run the Application

@@ -131,7 +131,7 @@ def load_dataset():
     """Load a dataset into the system."""
     try:
         data = request.get_json()
-        dataset_path = data.get('dataset_path', 'data/llm_dataset_v10.gz')
+        dataset_path = data.get('dataset_path', 'data/llm_dataset_v11.gz')
         table_name = data.get('table_name', 'sales_data')
         
         logger.info(f"Dataset load requested: {dataset_path} -> {table_name}")
@@ -147,7 +147,12 @@ def load_dataset():
             }), 404
         
         system = get_nlq_system()
-        result = system.load_data(dataset_path, table_name)
+        # If table already present skip
+        if system.fast_attach_existing(table_name):
+            logger.info("Using existing persisted table – skipping raw load")
+            result = system.loaded_tables[table_name]
+        else:
+            result = system.load_data(dataset_path, table_name)
         
         logger.info(f"Dataset loaded successfully: {result['total_rows']:,} rows into {table_name}")
         return jsonify({
@@ -161,6 +166,32 @@ def load_dataset():
             'success': False,
             'message': f'Failed to load dataset: {str(e)}'
         }), 500
+
+@app.route('/api/refresh_table', methods=['POST'])
+def refresh_table():
+    """Force reload (drop and re-load) the table from dataset path."""
+    try:
+        data = request.get_json() or {}
+        dataset_path = data.get('dataset_path', 'data/llm_dataset_v11.gz')
+        table_name = data.get('table_name', 'sales_data')
+        system = get_nlq_system()
+        system.reset_table(table_name)
+        result = system.load_data(str(Path(dataset_path).expanduser().resolve()), table_name)
+        return jsonify({'success': True, 'message': 'Table refreshed', 'data': result})
+    except Exception as e:
+        logger.error(f"Refresh failed: {e}")
+        return jsonify({'success': False, 'message': f'Refresh failed: {e}'}), 500
+
+@app.route('/api/delete_db', methods=['POST'])
+def delete_db():
+    """Delete entire DuckDB file for a clean rebuild."""
+    try:
+        system = get_nlq_system()
+        ok = system.delete_database()
+        return jsonify({'success': ok, 'message': 'Database deleted' if ok else 'Delete failed'})
+    except Exception as e:
+        logger.error(f"Delete DB failed: {e}")
+        return jsonify({'success': False, 'message': f'Delete failed: {e}'}), 500
 
 @app.route('/api/query', methods=['POST'])
 def process_query():

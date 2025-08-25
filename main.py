@@ -151,7 +151,7 @@ def example_queries() -> List[str]:
 
 def parse_args(argv: Optional[List[str]] = None):
     p = argparse.ArgumentParser(description="Natural Language to SQL CLI")
-    p.add_argument("--data", "-d", default="data/llm_dataset_v10.gz", help="Path to dataset (.csv/.gz)")
+    p.add_argument("--data", "-d", default="data/llm_dataset_v11.gz", help="Path to dataset (.csv/.gz)")
     p.add_argument("--table", "-t", default="sales_data", help="Destination table name")
     p.add_argument("--query", "-q", help="Run a single NLQ and exit")
     p.add_argument("--interactive", "-i", action="store_true", help="Enter interactive shell after loading data")

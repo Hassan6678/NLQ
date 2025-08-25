@@ -37,6 +37,23 @@ class DatabaseManager:
 			self.connections.append(conn)
 		logger.info(f"Initialized {len(self.connections)} database connections")
 
+	def close_all(self):
+		"""Close all pooled connections (for deleting/rebuilding DB file)."""
+		with self.connection_lock:
+			for c in self.connections:
+				try:
+					c.close()
+				except Exception:
+					pass
+			self.connections.clear()
+		with self.active_lock:
+			for _, c in list(self.active_connections.items()):
+				try:
+					c.close()
+				except Exception:
+					pass
+			self.active_connections.clear()
+
 	def _quote_identifier(self, name: str) -> str:
 		if __import__('re').match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
 			return name
@@ -54,6 +71,46 @@ class DatabaseManager:
 				with self.connection_lock:
 					self.connections.append(conn)
 		return _gen()
+
+	def table_exists(self, table_name: str) -> bool:
+		"""Check if a table exists in the current DuckDB database file."""
+		try:
+			with self.get_connection() as conn:
+				res = conn.execute("SELECT * FROM information_schema.tables WHERE table_name = ?", [table_name]).fetchone()
+			return res is not None
+		except Exception:
+			return False
+
+	def get_table_row_count(self, table_name: str) -> int:
+		try:
+			with self.get_connection() as conn:
+				res = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+				return int(res[0]) if res else 0
+		except Exception:
+			return 0
+
+	def load_existing_table_schema(self, table_name: str) -> bool:
+		"""Populate table_schemas entry for an already existing table (persisted DB)."""
+		try:
+			with self.get_connection() as conn:
+				desc = conn.execute(f"DESCRIBE {table_name}").fetchall()
+				columns = [row[0] for row in desc]
+				schema_info = []
+				for row in desc:
+					col = row[0]
+					logical_type = row[1]
+					schema_info.append(f"{self._quote_identifier(col)} {logical_type}")
+				sample = conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchdf().to_dict('records')
+				self.table_schemas[table_name] = {
+					"columns": columns,
+					"schema": ", ".join(schema_info),
+					"sample_data": sample,
+					"table_name": table_name,
+				}
+			return True
+		except Exception as e:
+			logger.warning(f"load_existing_table_schema failed: {e}")
+			return False
 
 	def load_csv_chunked(self, file_path: str, table_name: str) -> Dict[str, Any]:
 		if not os.path.exists(file_path):
