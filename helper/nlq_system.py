@@ -1,4 +1,5 @@
 import time
+import os
 import re
 import logging
 from typing import List, Optional, Tuple, Dict, Any
@@ -24,6 +25,55 @@ class NLQSystem:
         self.loaded_tables = {}
         
         logger.info("NLQ System initialized successfully")
+
+    # ---------------- Persistence helpers -----------------
+    def fast_attach_existing(self, table_name: str = "sales_data") -> bool:
+        """Attempt to attach already materialized table from existing DuckDB file without reloading raw data.
+        Returns True if table metadata prepared (table exists) else False."""
+        if self.db_manager.table_exists(table_name):
+            if self.db_manager.load_existing_table_schema(table_name):
+                row_count = self.db_manager.get_table_row_count(table_name)
+                self.loaded_tables[table_name] = {
+                    "table_name": table_name,
+                    "total_rows": row_count,
+                    "duration": 0.0,
+                    "chunks_processed": 0,
+                    "schema": self.db_manager.table_schemas.get(table_name, {})
+                }
+                logger.info(f"Attached existing table '{table_name}' ({row_count:,} rows) from persisted DB")
+                return True
+        return False
+
+    def delete_database(self) -> bool:
+        """Close connections and delete DuckDB file for a clean rebuild."""
+        try:
+            path = config.database.db_path
+            self.db_manager.close_all()
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"Deleted database file: {path}")
+            # Re-init pool
+            self.db_manager._initialize_connections()
+            self.loaded_tables.clear()
+            self.cache.query_cache.clear()
+            return True
+        except Exception as e:
+            logger.error(f"delete_database failed: {e}")
+            return False
+
+    def reset_table(self, table_name: str = "sales_data") -> bool:
+        """Drop a single table and metadata (keeping DB)."""
+        try:
+            if not self.db_manager.table_exists(table_name):
+                return True
+            with self.db_manager.get_connection() as conn:
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            self.loaded_tables.pop(table_name, None)
+            self.db_manager.table_schemas.pop(table_name, None)
+            return True
+        except Exception as e:
+            logger.warning(f"reset_table failed: {e}")
+            return False
     
     def load_data(self, file_path: str, table_name: str = "sales_data") -> Dict[str, Any]:
         """Load data file with optimized processing."""
@@ -769,16 +819,47 @@ class NLQSystem:
         """Inject region filter into SQL if NLQ mentions a region and SQL lacks a region filter."""
         try:
             nlq_lower = nlq.lower()
-            # Match tokens like South-A, North A, Central-A, etc.
-            m = re.search(r"\b(north|south|central)[\-\s]?([ab])\b", nlq_lower)
-            if not m:
-                return sql
-            region = m.group(1).capitalize() + "-" + m.group(2).upper()
-            # If SQL already filters on region, skip
-            if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
-                return sql
-            # Inject WHERE/AND region = 'X'
-            return self._inject_filter_clause(sql, f"region = '{region}'")
+            
+            # Enhanced region detection patterns
+            # 1. Exact match: Central-A, North B, South-A, etc.
+            exact_match = re.search(r"\b(north|south|central|east|west)[\-\s]?([ab])\b", nlq_lower)
+            if exact_match:
+                region = exact_match.group(1).capitalize() + "-" + exact_match.group(2).upper()
+                # If SQL already filters on region, skip
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                # Inject exact region filter
+                return self._inject_filter_clause(sql, f"region = '{region}'")
+            
+            # 2. Partial match: Central, North, South, etc. (without A/B suffix)
+            partial_match = re.search(r"\b(north|south|central|east|west)\b", nlq_lower)
+            if partial_match:
+                region_base = partial_match.group(1).capitalize()
+                # If SQL already filters on region, skip
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                # Use LIKE operator for partial matching (DuckDB compatible)
+                # This will match Central-A, Central-B, Central-C, etc.
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            # 3. Additional patterns for more flexible matching
+            # Handle "Central region", "North area", etc.
+            region_with_context = re.search(r"\b(north|south|central|east|west)\s+(region|area|territory)\b", nlq_lower)
+            if region_with_context:
+                region_base = region_with_context.group(1).capitalize()
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            # 4. Handle abbreviated forms: "Central reg", "North reg", etc.
+            region_abbrev = re.search(r"\b(north|south|central|east|west)\s+reg\b", nlq_lower)
+            if region_abbrev:
+                region_base = region_abbrev.group(1).capitalize()
+                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", sql):
+                    return sql
+                return self._inject_filter_clause(sql, f"region LIKE '{region_base}-%'")
+            
+            return sql
         except Exception:
             return sql
 
@@ -787,7 +868,16 @@ class NLQSystem:
         try:
             nlq_lower = nlq.lower()
             # If NLQ mentions region, do nothing
-            if re.search(r"\b(north|south|central)[\-\s]?([ab])\b", nlq_lower):
+            if re.search(r"\b(north|south|central|east|west)[\-\s]?([ab])\b", nlq_lower):
+                return sql
+            # Also check for partial region mentions
+            if re.search(r"\b(north|south|central|east|west)\b", nlq_lower):
+                return sql
+            # Check for region with context
+            if re.search(r"\b(north|south|central|east|west)\s+(region|area|territory)\b", nlq_lower):
+                return sql
+            # Check for abbreviated forms
+            if re.search(r"\b(north|south|central|east|west)\s+reg\b", nlq_lower):
                 return sql
 
             # If no WHERE present, nothing to do
@@ -846,11 +936,13 @@ class NLQSystem:
                 return [p for p in parts if p]
 
             conditions = split_top_level_and(where_body)
-            # Identify region conditions
+            # Identify region conditions (including LIKE patterns)
             region_conds = []
             keep_conds = []
             for c in conditions:
-                if re.search(r"(?is)\bregion\s*=\s*'[^']+'", c) or re.search(r"(?is)\bregion\s+in\s*\([^)]+\)", c):
+                if (re.search(r"(?is)\bregion\s*=\s*'[^']+'", c) or 
+                    re.search(r"(?is)\bregion\s+in\s*\([^)]+\)", c) or
+                    re.search(r"(?is)\bregion\s+like\s*'[^']+'", c)):
                     region_conds.append(c)
                 else:
                     keep_conds.append(c)
@@ -1322,14 +1414,17 @@ class NLQSystem:
             explicit_region = any(term in nlq_lower for term in region_terms)
             
             if not explicit_region:
-                # Remove region filters from SQL
-                # Pattern: region = 'X' or region IN ('X', 'Y')
+                # Remove region filters from SQL (including LIKE patterns)
+                # Pattern: region = 'X' or region IN ('X', 'Y') or region LIKE 'X%'
                 sql = re.sub(r"(?i)\s+AND\s+region\s*=\s*['\"][^'\"]*['\"]", "", sql)
                 sql = re.sub(r"(?i)\s+AND\s+region\s+IN\s*\([^)]+\)", "", sql)
+                sql = re.sub(r"(?i)\s+AND\s+region\s+LIKE\s*['\"][^'\"]*['\"]", "", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s+AND", " WHERE", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s*=\s*['\"][^'\"]*['\"]\s*$", "", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s+AND", " WHERE", sql)
                 sql = re.sub(r"(?i)\s+WHERE\s+region\s+IN\s*\([^)]*\)\s*$", "", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+LIKE\s*['\"][^'\"]*['\"]\s+AND", " WHERE", sql)
+                sql = re.sub(r"(?i)\s+WHERE\s+region\s+LIKE\s*['\"][^'\"]*['\"]\s*$", "", sql)
                 
                 # Clean up empty WHERE clauses
                 sql = re.sub(r"\s+WHERE\s+AND", " WHERE", sql)

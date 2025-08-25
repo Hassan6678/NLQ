@@ -140,7 +140,7 @@ def load_sales_data():
         with st.spinner("🔄 Loading sales data..."):
             # Check for data file
             data_files = [
-                "./data/llm_dataset_v10.gz",
+                "./data/llm_dataset_v11.gz",
                 "./data/sales.csv",
                 "./data/sales_data.csv"
             ]

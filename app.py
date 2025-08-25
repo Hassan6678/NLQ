@@ -21,27 +21,23 @@ app.secret_key = 'your-secret-key-here'  # Change this in production
 
 # Configure logging
 def setup_logging():
-    """Setup file-based logging with rotation."""
+    """Setup single log file per session."""
     # Create logs directory if it doesn't exist
     logs_dir = Path('logs')
     logs_dir.mkdir(exist_ok=True)
     
-    # Generate timestamp for log file
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = logs_dir / f'app_{timestamp}.log'
+    # Use single log file per session (not per run)
+    log_file = logs_dir / 'app_session.log'
     
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file, mode='w'),  # 'w' mode overwrites each session
             logging.StreamHandler()  # Also log to console
         ]
     )
-    
-    # Clean up old log files
-    cleanup_old_logs(logs_dir)
     
     return logging.getLogger(__name__)
 
@@ -79,6 +75,22 @@ def get_nlq_system() -> NLQSystem:
         nlq_system = NLQSystem()
     return nlq_system
 
+def ensure_data_loaded(dataset_path: str = 'data/llm_dataset_v11.gz', table_name: str = 'sales_data') -> None:
+    """Startup data loader: DB first, gz fallback."""
+    try:
+        system = get_nlq_system()
+        db_exists = os.path.exists(config.database.db_path)
+        
+        if db_exists and system.fast_attach_existing(table_name):
+            logger.info(f"✅ Using existing DB table '{table_name}'")
+            return
+        
+        logger.info("🔄 Loading dataset from gz into DB (first run or missing table)")
+        system.load_data(str(Path(dataset_path).expanduser().resolve()), table_name)
+        logger.info("✅ Dataset loaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to load data: {e}")
+
 @app.route('/')
 def index():
     """Render the main chat interface."""
@@ -110,10 +122,10 @@ def health_check():
 
 @app.route('/api/initialize', methods=['POST'])
 def initialize_system():
-    """Initialize the NLQ system."""
+    """Initialize the NLQ system and ensure data is loaded."""
     logger.info("System initialization requested")
     try:
-        system = get_nlq_system()
+        ensure_data_loaded()
         logger.info("System initialized successfully")
         return jsonify({
             'success': True,
@@ -131,7 +143,7 @@ def load_dataset():
     """Load a dataset into the system."""
     try:
         data = request.get_json()
-        dataset_path = data.get('dataset_path', 'data/llm_dataset_v10.gz')
+        dataset_path = data.get('dataset_path', 'data/llm_dataset_v11.gz')
         table_name = data.get('table_name', 'sales_data')
         
         logger.info(f"Dataset load requested: {dataset_path} -> {table_name}")
@@ -147,7 +159,12 @@ def load_dataset():
             }), 404
         
         system = get_nlq_system()
-        result = system.load_data(dataset_path, table_name)
+        # If table already present skip
+        if system.fast_attach_existing(table_name):
+            logger.info("Using existing persisted table – skipping raw load")
+            result = system.loaded_tables[table_name]
+        else:
+            result = system.load_data(dataset_path, table_name)
         
         logger.info(f"Dataset loaded successfully: {result['total_rows']:,} rows into {table_name}")
         return jsonify({
@@ -161,6 +178,63 @@ def load_dataset():
             'success': False,
             'message': f'Failed to load dataset: {str(e)}'
         }), 500
+
+@app.route('/api/refresh_table', methods=['POST'])
+def refresh_table():
+    """Force reload (drop and re-load) the table from dataset path."""
+    try:
+        data = request.get_json() or {}
+        dataset_path = data.get('dataset_path', 'data/llm_dataset_v11.gz')
+        table_name = data.get('table_name', 'sales_data')
+        system = get_nlq_system()
+        system.reset_table(table_name)
+        result = system.load_data(str(Path(dataset_path).expanduser().resolve()), table_name)
+        return jsonify({'success': True, 'message': 'Table refreshed', 'data': result})
+    except Exception as e:
+        logger.error(f"Refresh failed: {e}")
+        return jsonify({'success': False, 'message': f'Refresh failed: {e}'}), 500
+
+@app.route('/api/refresh', methods=['POST'])
+def refresh():
+    """Complete refresh: delete DB and reload from gz."""
+    try:
+        data = request.get_json(silent=True) or {}
+        dataset_path = data.get('dataset_path', 'data/llm_dataset_v11.gz')
+        table_name = data.get('table_name', 'sales_data')
+        
+        logger.info("🔄 Starting complete refresh (delete DB + reload from gz)")
+        
+        system = get_nlq_system()
+        
+        # Delete entire database
+        if system.delete_database():
+            logger.info("✅ Database deleted successfully")
+        else:
+            logger.warning("⚠️ Database deletion had issues, continuing...")
+        
+        # Reload from gz file
+        result = system.load_data(str(Path(dataset_path).expanduser().resolve()), table_name)
+        
+        logger.info("✅ Refresh completed successfully")
+        return jsonify({
+            'success': True, 
+            'message': f'Refresh completed: {result.get("total_rows", 0):,} rows loaded',
+            'data': result
+        })
+    except Exception as e:
+        logger.error(f"❌ Refresh failed: {e}")
+        return jsonify({'success': False, 'message': f'Refresh failed: {e}'}), 500
+
+@app.route('/api/delete_db', methods=['POST'])
+def delete_db():
+    """Delete entire DuckDB file for a clean rebuild."""
+    try:
+        system = get_nlq_system()
+        ok = system.delete_database()
+        return jsonify({'success': ok, 'message': 'Database deleted' if ok else 'Delete failed'})
+    except Exception as e:
+        logger.error(f"Delete DB failed: {e}")
+        return jsonify({'success': False, 'message': f'Delete failed: {e}'}), 500
 
 @app.route('/api/query', methods=['POST'])
 def process_query():
@@ -235,6 +309,36 @@ def process_query():
             'message': f'Unexpected error: {str(e)}'
         }), 500
 
+@app.route('/api/question', methods=['POST'])
+def question():
+    """Simple NLQ API for React developer - just question and answer."""
+    try:
+        data = request.get_json(silent=True) or {}
+        question = data.get('question', '').strip()
+        
+        if not question:
+            return jsonify({'success': False, 'message': 'question is required'}), 400
+        
+        logger.info(f"query: {question}")
+        
+        # Ensure data is loaded
+        ensure_data_loaded()
+        
+        system = get_nlq_system()
+        result = system.query(question)
+        
+        return jsonify({
+            'success': True,
+            'question': question,
+            'answer': result.summary_text or f"Query returned {result.row_count} rows",
+            'sql': result.sql_query,
+            'row_count': result.row_count
+        })
+        
+    except Exception as e:
+        logger.error(f"Simple query failed: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 @app.route('/api/history', methods=['GET'])
 def get_history():
     """Get query history."""
@@ -273,5 +377,9 @@ def clear_history():
     })
 
 if __name__ == '__main__':
-    logger.info("Starting Flask application")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    logger.info("🚀 Starting Flask application")
+    # Ensure data is loaded on startup
+    ensure_data_loaded()
+    logger.info("✅ Startup data loading completed")
+    # Disable auto-reloader to prevent constant restarts
+    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)

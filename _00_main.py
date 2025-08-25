@@ -2019,8 +2019,8 @@ def main():
         
         # Load data
         print("Loading sales data...")
-        if os.path.exists("./data/llm_dataset_v10.gz"):
-            load_result = system.load_data("./data/llm_dataset_v10.gz", "sales_data")
+        if os.path.exists("./data/llm_dataset_v11.gz"):
+            load_result = system.load_data("./data/llm_dataset_v11.gz", "sales_data")
             print(f"✅ Loaded {load_result['total_rows']:,} rows in {load_result['duration']:.2f}s")
         else:
             print("❌ sales not found. Please ensure the file exists.")
