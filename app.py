@@ -1,9 +1,5 @@
-"""
-Streamlit Web App for NLQ (Natural Language Query) System
-A clean and attractive web interface for querying your sales data using natural language.
-"""
-
 from flask import Flask, render_template, request, jsonify, session
+from flask_cors import CORS
 import os
 import json
 import time
@@ -12,12 +8,20 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
 import glob
+import click
+import sys
+import os, io
+
+os.environ["FLASK_RUN_NO_COLOR"] = "1"  # Just in case
+
+click.echo = lambda x: sys.stdout.write(x + '\n')
 
 from config import config
 from helper.nlq_system import NLQSystem
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'  # Change this in production
+CORS(app, supports_credentials=True) 
 
 # Configure logging
 def setup_logging():
@@ -29,13 +33,15 @@ def setup_logging():
     # Use single log file per session (not per run)
     log_file = logs_dir / 'app_session.log'
     
+    utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file, mode='w'),  # 'w' mode overwrites each session
-            logging.StreamHandler()  # Also log to console
+            logging.FileHandler(log_file, mode='w',encoding='utf-8'),  # 'w' mode overwrites each session
+            logging.StreamHandler(utf8_stdout)  # Also log to console
         ]
     )
     
@@ -71,6 +77,7 @@ nlq_system: Optional[NLQSystem] = None
 def get_nlq_system() -> NLQSystem:
     """Get or initialize the NLQ system."""
     global nlq_system
+    # logger.info("🔄 Loading NLQ system")
     if nlq_system is None:
         nlq_system = NLQSystem()
     return nlq_system
@@ -79,6 +86,7 @@ def ensure_data_loaded(dataset_path: str = 'data/llm_dataset_v11.gz', table_name
     """Startup data loader: DB first, gz fallback."""
     try:
         system = get_nlq_system()
+        
         db_exists = os.path.exists(config.database.db_path)
         
         if db_exists and system.fast_attach_existing(table_name):
@@ -271,6 +279,15 @@ def process_query():
         total_time = time.time() - start_time
         
         # Format the response
+        # Ensure JSON-safe data (replace NaN/Inf and numpy scalars)
+        try:
+            import pandas as pd  # local import to avoid heavy import at module load
+            data_records = result.data.replace([float('inf'), float('-inf')], pd.NA).where(lambda d: ~d.isna(), None).to_dict('records') if result.row_count > 0 else []
+        except Exception:
+            try:
+                data_records = json.loads(result.data.to_json(orient='records')) if result.row_count > 0 else []
+            except Exception:
+                data_records = result.data.to_dict('records') if result.row_count > 0 else []
         response = {
             'success': True,
             'query': nlq,
@@ -279,7 +296,7 @@ def process_query():
             'row_count': result.row_count,
             'execution_time': result.execution_time,
             'total_time': total_time,
-            'data': result.data.to_dict('records') if result.row_count > 0 else [],
+            'data': data_records,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
         
@@ -309,9 +326,9 @@ def process_query():
             'message': f'Unexpected error: {str(e)}'
         }), 500
 
-@app.route('/api/simple_query', methods=['POST'])
-def simple_query():
-    """Simple NLQ API for React developer - just question and answer."""
+@app.route('/api/question', methods=['POST'])
+def question():
+    """NLQ API for React developer - just question and answer."""
     try:
         data = request.get_json(silent=True) or {}
         question = data.get('question', '').strip()
@@ -319,21 +336,42 @@ def simple_query():
         if not question:
             return jsonify({'success': False, 'message': 'question is required'}), 400
         
-        logger.info(f"Simple query: {question}")
+        logger.info(f"query: {question}")
         
         # Ensure data is loaded
-        ensure_data_loaded()
+        # ensure_data_loaded()
         
         system = get_nlq_system()
         result = system.query(question)
+
+        # Ensure JSON-safe data for this endpoint too
+        try:
+            import pandas as pd  # local import
+            data_records = result.data.replace([float('inf'), float('-inf')], pd.NA).where(lambda d: ~d.isna(), None).to_dict('records') if result.row_count > 0 else []
+        except Exception:
+            try:
+                data_records = json.loads(result.data.to_json(orient='records')) if result.row_count > 0 else []
+            except Exception:
+                data_records = result.data.to_dict('records') if result.row_count > 0 else []
         
-        return jsonify({
+        # Respect empty results: do not fabricate a summary
+        if result.row_count and result.summary_text:
+            answer = result.summary_text
+        elif result.row_count == 0:
+            answer = "No data found for the specified query."
+        else:
+            answer = "Sorry, No data found for the specified query."
+        response = {
             'success': True,
             'question': question,
-            'answer': result.summary_text or f"Query returned {result.row_count} rows",
+            'answer': answer,
             'sql': result.sql_query,
-            'row_count': result.row_count
-        })
+            'row_count': result.row_count,
+            'execution_time': getattr(result, 'execution_time', None),
+            'data': data_records if hasattr(result, 'data') and result.row_count > 0 else [],
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        return jsonify(response)
         
     except Exception as e:
         logger.error(f"Simple query failed: {e}")
@@ -377,9 +415,9 @@ def clear_history():
     })
 
 if __name__ == '__main__':
-    logger.info("🚀 Starting Flask application")
+    logger.info("Starting Flask application")
     # Ensure data is loaded on startup
     ensure_data_loaded()
-    logger.info("✅ Startup data loading completed")
+    logger.info("Startup data loading completed")
     # Disable auto-reloader to prevent constant restarts
-    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)
+    app.run(debug=True, host='0.0.0.0', port=8054, use_reloader=False)

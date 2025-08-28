@@ -18,59 +18,109 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
 	"""Optimized database manager with connection pooling and chunked processing."""
 
+	# def __init__(self):
+	# 	self.connections = []
+	# 	self.connection_lock = threading.Lock()
+	# 	self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
+	# 	self.active_lock = threading.Lock()
+	# 	self.table_schemas: Dict[str, Dict[str, Any]] = {}
+	# 	self._initialize_connections()
+
+	# def _initialize_connections(self):
+	# 	for _ in range(config.database.connection_pool_size):
+	# 		conn = duckdb.connect(config.database.db_path)
+	# 		conn.execute(f"SET memory_limit='{config.database.memory_limit}'")
+	# 		conn.execute(f"SET threads={config.database.threads}")
+	# 		conn.execute(f"SET enable_progress_bar=false")
+	# 		if config.database.enable_parallel:
+	# 			conn.execute("PRAGMA threads=4")
+	# 		self.connections.append(conn)
+	# 	logger.info(f"Initialized {len(self.connections)} database connections")
+
+	# def close_all(self):
+	# 	"""Close all pooled connections (for deleting/rebuilding DB file)."""
+	# 	with self.connection_lock:
+	# 		for c in self.connections:
+	# 			try:
+	# 				c.close()
+	# 			except Exception:
+	# 				pass
+	# 		self.connections.clear()
+	# 	with self.active_lock:
+	# 		for _, c in list(self.active_connections.items()):
+	# 			try:
+	# 				c.close()
+	# 			except Exception:
+	# 				pass
+	# 		self.active_connections.clear()
+
 	def __init__(self):
-		self.connections = []
-		self.connection_lock = threading.Lock()
 		self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
 		self.active_lock = threading.Lock()
 		self.table_schemas: Dict[str, Dict[str, Any]] = {}
-		self._initialize_connections()
+		self.local = threading.local()
+		self._initialize_database()
 
-	def _initialize_connections(self):
-		for _ in range(config.database.connection_pool_size):
-			conn = duckdb.connect(config.database.db_path)
-			conn.execute(f"SET memory_limit='{config.database.memory_limit}'")
-			conn.execute(f"SET threads={config.database.threads}")
-			conn.execute(f"SET enable_progress_bar=false")
-			if config.database.enable_parallel:
-				conn.execute("PRAGMA threads=4")
-			self.connections.append(conn)
-		logger.info(f"Initialized {len(self.connections)} database connections")
+	def _init_connection(self) -> duckdb.DuckDBPyConnection:
+		"""Initialize a DuckDB connection with proper settings."""
+		conn = duckdb.connect(config.database.db_path)
+		conn.execute(f"SET memory_limit='{config.database.memory_limit}'")
+		conn.execute(f"SET threads={config.database.threads}")
+		conn.execute(f"SET enable_progress_bar=false")
+		if config.database.enable_parallel:
+			conn.execute("PRAGMA threads=4")
+		return conn
+
+	def _initialize_database(self):
+		"""Ensure database file is valid and log once at startup."""
+		try:
+			conn = self._init_connection()
+			conn.close()
+			logger.info(f"Database initialized at {config.database.db_path}")
+		except Exception as e:
+			logger.error(f"Failed to initialize database: {e}", exc_info=True)
+			raise
+
+	def get_connection(self):
+		"""Return a thread-local connection (creates one if missing)."""
+		from contextlib import contextmanager
+
+		@contextmanager
+		def _gen():
+			if not hasattr(self.local, "conn") or self.local.conn is None:
+				self.local.conn = self._init_connection()
+				logger.debug(f"Created new DuckDB connection for thread {threading.get_ident()}")
+			yield self.local.conn
+		return _gen()
 
 	def close_all(self):
-		"""Close all pooled connections (for deleting/rebuilding DB file)."""
-		with self.connection_lock:
-			for c in self.connections:
-				try:
-					c.close()
-				except Exception:
-					pass
-			self.connections.clear()
-		with self.active_lock:
-			for _, c in list(self.active_connections.items()):
-				try:
-					c.close()
-				except Exception:
-					pass
-			self.active_connections.clear()
+		"""Close thread-local connection if it exists."""
+		if hasattr(self.local, "conn") and self.local.conn is not None:
+			try:
+				self.local.conn.close()
+				logger.debug(f"Closed DuckDB connection for thread {threading.get_ident()}")
+			except Exception:
+				pass
+			self.local.conn = None
+
 
 	def _quote_identifier(self, name: str) -> str:
 		if __import__('re').match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
 			return name
 		return '"' + name.replace('"', '""') + '"'
 
-	def get_connection(self):
-		from contextlib import contextmanager
-		@contextmanager
-		def _gen():
-			with self.connection_lock:
-				conn = self.connections.pop() if self.connections else duckdb.connect(config.database.db_path)
-			try:
-				yield conn
-			finally:
-				with self.connection_lock:
-					self.connections.append(conn)
-		return _gen()
+	# def get_connection(self):
+	# 	from contextlib import contextmanager
+	# 	@contextmanager
+	# 	def _gen():
+	# 		with self.connection_lock:
+	# 			conn = self.connections.pop() if self.connections else duckdb.connect(config.database.db_path)
+	# 		try:
+	# 			yield conn
+	# 		finally:
+	# 			with self.connection_lock:
+	# 				self.connections.append(conn)
+	# 	return _gen()
 
 	def table_exists(self, table_name: str) -> bool:
 		"""Check if a table exists in the current DuckDB database file."""

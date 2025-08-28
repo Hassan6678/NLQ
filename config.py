@@ -28,8 +28,8 @@ class ModelConfig:
     model_path: str = "models/llama-3-sqlcoder-8b.Q6_K.gguf"
     summarizer_model_path: str = "models/Mistral-7B-Instruct-v0.1.Q6_K.gguf"
     n_ctx: int = 2048
-    n_threads: int = 6
-    n_gpu_layers: int = 20
+    n_threads: int = 16
+    n_gpu_layers: int = 0  # Changed from 20 to 0 - DISABLES GPU/CUDA
     temperature: float = 0.0
     max_tokens: int = 512
     verbose: bool = False
@@ -100,19 +100,21 @@ class Config:
             self.database.memory_limit = "1GB"
             self.database.cache_size = "256MB"
             self.model.n_ctx = 1024
-            self.model.n_gpu_layers = 10
+            self.model.n_gpu_layers = 0  # Always use CPU for low memory systems - changed from 35
         elif memory_gb >= 16:
             self.database.chunk_size = 100000
             self.database.memory_limit = "4GB"
             self.database.cache_size = "1GB"
             self.model.n_ctx = 4096
-            self.model.n_gpu_layers = 35
+            self.model.n_gpu_layers = 0  # Force CPU usage - changed from 35
         
-        # Adjust threading based on CPU
-        self.database.threads = min(cpu_count, 8)
-        self.model.n_threads = min(cpu_count - 1, 8)
-        
+        # Adjust threading based on CPU - limit to prevent system overload
+        self.database.threads = min(cpu_count // 2, 24)  # Use half CPU cores, max 8
+        self.model.n_threads = min(cpu_count // 2, 64)   # Use half CPU cores, max 12
+
         print(f"Auto-configured for {memory_gb:.1f}GB RAM, {cpu_count} CPUs")
+        print(f"CPU-only mode: GPU layers = {self.model.n_gpu_layers}")
+        print(f"Limited CPU usage: Model threads = {self.model.n_threads}, DB threads = {self.database.threads}")
     
     def _load_from_env(self):
         """Load configuration from environment variables."""
