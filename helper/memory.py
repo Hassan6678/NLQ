@@ -27,10 +27,7 @@ class MemoryMonitor:
 			end_memory = self.get_memory_usage()
 			duration = time.time() - start_time
 			memory_delta = end_memory - start_memory
-			if getattr(config.logging, "enable_performance_logging", True):
-				import logging
-				logger = logging.getLogger(__name__)
-				logger.info(f"{operation_name} - Duration: {duration:.2f}s, Memory delta: {memory_delta:.1f}MB, Peak: {self.peak_usage:.1f}MB")
+			# Memory monitoring is done silently for performance tracking
 
 
 memory_monitor = MemoryMonitor()

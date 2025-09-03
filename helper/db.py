@@ -18,42 +18,6 @@ logger = logging.getLogger(__name__)
 class DatabaseManager:
 	"""Optimized database manager with connection pooling and chunked processing."""
 
-	# def __init__(self):
-	# 	self.connections = []
-	# 	self.connection_lock = threading.Lock()
-	# 	self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
-	# 	self.active_lock = threading.Lock()
-	# 	self.table_schemas: Dict[str, Dict[str, Any]] = {}
-	# 	self._initialize_connections()
-
-	# def _initialize_connections(self):
-	# 	for _ in range(config.database.connection_pool_size):
-	# 		conn = duckdb.connect(config.database.db_path)
-	# 		conn.execute(f"SET memory_limit='{config.database.memory_limit}'")
-	# 		conn.execute(f"SET threads={config.database.threads}")
-	# 		conn.execute(f"SET enable_progress_bar=false")
-	# 		if config.database.enable_parallel:
-	# 			conn.execute("PRAGMA threads=4")
-	# 		self.connections.append(conn)
-	# 	logger.info(f"Initialized {len(self.connections)} database connections")
-
-	# def close_all(self):
-	# 	"""Close all pooled connections (for deleting/rebuilding DB file)."""
-	# 	with self.connection_lock:
-	# 		for c in self.connections:
-	# 			try:
-	# 				c.close()
-	# 			except Exception:
-	# 				pass
-	# 		self.connections.clear()
-	# 	with self.active_lock:
-	# 		for _, c in list(self.active_connections.items()):
-	# 			try:
-	# 				c.close()
-	# 			except Exception:
-	# 				pass
-	# 		self.active_connections.clear()
-
 	def __init__(self):
 		self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
 		self.active_lock = threading.Lock()
@@ -76,7 +40,7 @@ class DatabaseManager:
 		try:
 			conn = self._init_connection()
 			conn.close()
-			logger.info(f"Database initialized at {config.database.db_path}")
+
 		except Exception as e:
 			logger.error(f"Failed to initialize database: {e}", exc_info=True)
 			raise
@@ -89,7 +53,6 @@ class DatabaseManager:
 		def _gen():
 			if not hasattr(self.local, "conn") or self.local.conn is None:
 				self.local.conn = self._init_connection()
-				logger.debug(f"Created new DuckDB connection for thread {threading.get_ident()}")
 			else:
 				# Validate connection is still alive
 				try:
@@ -101,7 +64,6 @@ class DatabaseManager:
 					except:
 						pass
 					self.local.conn = self._init_connection()
-					logger.debug(f"Recreated DuckDB connection for thread {threading.get_ident()}")
 			try:
 				yield self.local.conn
 			except Exception as e:
@@ -121,7 +83,6 @@ class DatabaseManager:
 		if hasattr(self.local, "conn") and self.local.conn is not None:
 			try:
 				self.local.conn.close()
-				logger.debug(f"Closed DuckDB connection for thread {threading.get_ident()}")
 			except Exception:
 				pass
 			self.local.conn = None
@@ -134,31 +95,16 @@ class DatabaseManager:
 			except Exception:
 				pass
 			self.local.conn = None
-		logger.info("Invalidated all connections due to database change")
 
 	def clear_schema_cache(self):
 		"""Clear all cached table schemas."""
 		self.table_schemas.clear()
-		logger.info("Cleared all cached table schemas")
-
 
 	def _quote_identifier(self, name: str) -> str:
 		if __import__('re').match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
 			return name
 		return '"' + name.replace('"', '""') + '"'
 
-	# def get_connection(self):
-	# 	from contextlib import contextmanager
-	# 	@contextmanager
-	# 	def _gen():
-	# 		with self.connection_lock:
-	# 			conn = self.connections.pop() if self.connections else duckdb.connect(config.database.db_path)
-	# 		try:
-	# 			yield conn
-	# 		finally:
-	# 			with self.connection_lock:
-	# 				self.connections.append(conn)
-	# 	return _gen()
 
 	def table_exists(self, table_name: str) -> bool:
 		"""Check if a table exists in the current DuckDB database file."""
@@ -203,7 +149,7 @@ class DatabaseManager:
 	def load_csv_chunked(self, file_path: str, table_name: str) -> Dict[str, Any]:
 		if not os.path.exists(file_path):
 			raise FileNotFoundError(f"CSV file not found: {file_path}")
-		logger.info(f"Loading CSV file: {file_path}")
+
 		start_time = time.time()
 		total_rows = 0
 		with self.get_connection() as conn:
@@ -232,7 +178,6 @@ class DatabaseManager:
 						"table_name": table_name,
 					}
 					first_chunk = False
-					logger.info(f"Created table {table_name} with {chunk_rows} rows")
 				else:
 					temp_table = f"temp_chunk_{chunk_count}"
 					conn.register(temp_table, chunk)
@@ -241,12 +186,11 @@ class DatabaseManager:
 				if chunk_count % 10 == 0:
 					elapsed = time.time() - start_time
 					rate = total_rows / elapsed if elapsed > 0 else 0
-					logger.info(f"Processed {chunk_count} chunks, {total_rows:,} rows ({rate:.0f} rows/sec)")
 					if memory_monitor.get_memory_usage() / 1024 > config.get_memory_info()["max_allowed_gb"]:
 						logger.warning("Memory usage approaching limit, consider reducing chunk size")
 			self._create_indexes(conn, table_name)
 		duration = time.time() - start_time
-		logger.info(f"Successfully loaded {total_rows:,} rows in {duration:.2f}s ({total_rows/duration:.0f} rows/sec)")
+
 		return {
 			"table_name": table_name,
 			"total_rows": total_rows,
@@ -281,22 +225,18 @@ class DatabaseManager:
 				if any(p in col_lower for p in ['id','date','time','region','category','type','month','year','city','brand','sku','customer','territory','route','area','distributor']):
 					try:
 						conn.execute(f"CREATE INDEX idx_{table_name}_{col} ON {table_name}({col})")
-						logger.info(f"✅ Created index on {table_name}.{col}")
 						index_success_count += 1
 					except Exception as e:
-						logger.warning(f"⚠️ Could not create index on {col}: {e}")
+						logger.warning(f"Could not create index on {col}: {e}")
 						index_error_count += 1
-
-			logger.info(f"Index creation completed: {index_success_count} successful, {index_error_count} failed")
 
 			# If many indexes failed, it might indicate a data quality issue
 			if index_error_count > index_success_count and index_error_count > 0:
-				logger.error(f"⚠️ High number of index creation failures ({index_error_count}) - check data quality")
+				logger.error(f"High number of index creation failures ({index_error_count}) - check data quality")
 
 		except Exception as e:
-			logger.error(f"❌ Error during index creation process: {e}")
+			logger.error(f"Error during index creation process: {e}")
 			# Don't fail the entire operation for index creation issues
-			logger.info("Continuing without indexes - performance may be affected")
 
 	# Time helpers
 	def get_latest_periods(self, table_name: str, limit: int = 2) -> List[Tuple[int, int]]:
@@ -387,7 +327,7 @@ class DatabaseManager:
 						try:
 							coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
 							conversion_summary["successful"] += 1
-							logger.debug(f"Converted {col} from {original_dtype} to Int64")
+
 						except Exception as e:
 							conversion_summary["warnings"].append(f"Failed to convert {col} to Int64: {e}")
 							conversion_summary["failed"] += 1
@@ -430,29 +370,16 @@ class DatabaseManager:
 								if (numeric.dropna() % 1 == 0).all():
 									coerced[col] = numeric.astype("Int64")
 									conversion_summary["successful"] += 1
-									logger.debug(f"Converted {col} from string to Int64")
 								else:
 									coerced[col] = numeric.astype("float64")
 									conversion_summary["successful"] += 1
-									logger.debug(f"Converted {col} from string to float64")
 						except Exception as e:
 							conversion_summary["warnings"].append(f"Failed numeric conversion for {col}: {e}")
 							conversion_summary["failed"] += 1
 
 				except Exception as e:
 					conversion_summary["warnings"].append(f"Unexpected error processing column {col}: {e}")
-					conversion_summary["failed"] += 1
-
-			# Log conversion summary
-			total_conversions = conversion_summary["successful"] + conversion_summary["failed"]
-			if total_conversions > 0:
-				logger.info(f"Data type conversion: {conversion_summary['successful']}/{total_conversions} successful")
-
-			if conversion_summary["warnings"]:
-				for warning in conversion_summary["warnings"][:3]:  # Log first 3 warnings
-					logger.warning(warning)
-				if len(conversion_summary["warnings"]) > 3:
-					logger.warning(f"... and {len(conversion_summary['warnings']) - 3} more conversion warnings")
+					conversion_summary["failed"] += 1			
 
 			return coerced
 

@@ -32,7 +32,6 @@ class QueryCache:
 		query_hash = self._get_query_hash(nlq)
 		if query_hash in self.query_cache:
 			self.cache_stats["hits"] += 1
-			logger.debug(f"SQL cache hit for query: {nlq[:50]}...")
 			return self.query_cache[query_hash]
 		self.cache_stats["misses"] += 1
 		return None
@@ -62,7 +61,6 @@ class QueryCache:
 						result = pickle.load(f)
 						result.from_cache = True
 						self.cache_stats["hits"] += 1
-						logger.debug(f"Result cache hit for SQL: {sql[:50]}...")
 						return result
 				else:
 					os.remove(cache_file)

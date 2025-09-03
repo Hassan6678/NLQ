@@ -101,7 +101,6 @@ class IntentExtractor:
             dimension = self._extract_dimension(text, table_cols)
             if not dimension:
                 return None
-            logger.info(f"Extracted dimension: '{dimension}' from query: '{text[:50]}...'")
 
             # Determine query type and analysis mode
             is_growth = self._is_growth_query(text)
@@ -142,11 +141,9 @@ class IntentExtractor:
             # Extract ordering and limit
             order_dir = "ASC" if self._is_ascending_query(text) else "DESC"
             limit = self._extract_limit(text)
-            logger.info(f"Extracted limit: {limit}, order_dir: {order_dir}")
 
             # Extract filters
             filters = self._extract_filters(text, table_cols, db_manager, table_name)
-            logger.info(f"Extracted filters: {filters}")
 
             return Intent(
                 dimension=dimension,
@@ -196,8 +193,6 @@ class IntentExtractor:
             r"(\w+)"
         ]
 
-        logger.info(f"Extracting dimension from: '{text[:50]}...'")
-
         for i, pattern in enumerate(dimension_patterns):
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
@@ -214,18 +209,15 @@ class IntentExtractor:
                 # Check if it's a valid dimension
                 result_dim = self._validate_and_normalize_dimension(potential_dim, available_dims)
                 if result_dim:
-                    logger.info(f"Found dimension '{result_dim}' using pattern {i+1}: '{pattern}'")
                     return result_dim
 
         # Fallback: look for any exact dimension match
         for dim in available_dims:
             if re.search(rf"\b{dim}\b", text, re.IGNORECASE):
-                logger.info(f"Found dimension '{dim}' using fallback pattern")
                 return dim
 
         # Default to region if available
         default_dim = "region" if "region" in table_cols else (available_dims[0] if available_dims else None)
-        logger.info(f"Using default dimension '{default_dim}'")
         return default_dim
 
     def _validate_and_normalize_dimension(self, potential_dim: str, available_dims: List[str]) -> Optional[str]:
@@ -340,11 +332,8 @@ class IntentExtractor:
         - "which city", "highest performing region"
         - "all regions", "show me cities"
         """
-        logger.info(f"Extracting limit from: '{text[:50]}...'")
-
         # Check for "all" keyword that implies no limit (or high limit)
         if "all" in text.lower():
-            logger.info("Found 'all' keyword, setting limit to 20")
             return 20  # Show all (reasonable limit)
 
         # Pattern 1: Qualifier + number patterns (e.g., "top 3", "bottom 5", "lowest 10")
@@ -360,7 +349,6 @@ class IntentExtractor:
                 for group in match.groups():
                     if group and group.isdigit():
                         limit = max(1, int(group))
-                        logger.info(f"Found limit {limit} using qualifier+number pattern")
                         return limit
 
         # Pattern 2: Just a number followed by dimension (e.g., "5 cities", "3 regions")
@@ -368,7 +356,6 @@ class IntentExtractor:
         match = re.search(number_dim_pattern, text, re.IGNORECASE)
         if match:
             limit = max(1, int(match.group(1)))
-            logger.info(f"Found limit {limit} using number+dimension pattern")
             return limit
 
         # Pattern 3: Single result indicators (which, what, highest without number)
@@ -384,18 +371,15 @@ class IntentExtractor:
                 keyword_pattern = rf"{keyword}\s*(\d*)"
                 keyword_match = re.search(keyword_pattern, text, re.IGNORECASE)
                 if keyword_match and not keyword_match.group(1):  # No number after keyword
-                    logger.info(f"Found single result keyword '{keyword}', setting limit to 1")
                     return 1
 
         # Pattern 4: Question words that imply single answers
         question_patterns = [r"which\s+\w+", r"what\s+\w+", r"show\s+me\s+\w+"]
         for pattern in question_patterns:
             if re.search(pattern, text, re.IGNORECASE):
-                logger.info(f"Found question pattern '{pattern}', setting limit to 1")
                 return 1
 
         # Default to showing top 5 for general queries
-        logger.info("No specific limit pattern found, using default limit of 5")
         return 5
 
     def _extract_filters(self, text: str, table_cols: List[str],
@@ -419,14 +403,12 @@ class IntentExtractor:
         exact_match = re.search(r"\b(north|south|central|east|west)[\-\s]?([ab])\b", text, re.IGNORECASE)
         if exact_match:
             region_name = f"{exact_match.group(1).capitalize()}-{exact_match.group(2).upper()}"
-            logger.info(f"Found exact region filter: '{region_name}'")
             return ("region", "=", region_name)
 
         # Partial region match (e.g., "Central region")
         partial_match = re.search(r"\b(north|south|central|east|west)\s+(region|area|territory)\b", text, re.IGNORECASE)
         if partial_match:
             base_region = partial_match.group(1).capitalize()
-            logger.info(f"Found partial region filter: '{base_region}-%'")
             return ("region", "LIKE", f"{base_region}-%")
 
         return None
@@ -456,8 +438,6 @@ class SQLGenerator:
         where_parts = self._build_where_parts(intent)
         where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
-        logger.info(f"Building SQL for dimension='{intent.dimension}', metric='{intent.metric}', mode={intent.metric_mode}")
-
         # Generate SQL based on mode
         if intent.metric_mode == QueryMode.STOCKOUT_PERCENT:
             sql = self._build_stockout_sql(dim_sql, table_name, where_clause, intent)
@@ -472,7 +452,6 @@ class SQLGenerator:
         else:  # SUM_METRIC
             sql = self._build_sum_sql(dim_sql, metric_sql, table_name, where_clause, intent)
 
-        logger.info(f"Generated SQL: {sql}")
         return sql
 
     def _build_where_parts(self, intent: Intent) -> List[str]:
@@ -622,8 +601,6 @@ class NLQSystem:
 
         self.loaded_tables = {}
 
-        logger.info("Enhanced NLQ System initialized successfully")
-
     # ---------------- Data Management -----------------
     def fast_attach_existing(self, table_name: str = "sales_data") -> bool:
         """Attach existing table without reloading."""
@@ -637,7 +614,6 @@ class NLQSystem:
                     "chunks_processed": 0,
                     "schema": self.db_manager.table_schemas.get(table_name, {})
                 }
-                logger.info(f"Attached existing table '{table_name}' ({row_count:,} rows)")
                 return True
         return False
 
@@ -648,7 +624,6 @@ class NLQSystem:
             self.db_manager.close_all()
             if os.path.exists(path):
                 os.remove(path)
-                logger.info(f"Deleted database: {path}")
             self.db_manager._initialize_connections()
             self.loaded_tables.clear()
             self.cache.query_cache.clear()
@@ -684,7 +659,6 @@ class NLQSystem:
                     # Only update if method exists (optional functionality)
                     if hasattr(self.llm_manager, 'update_latest_periods'):
                         self.llm_manager.update_latest_periods(latest_periods)
-                    logger.info(f"📅 Initialized LLM with latest periods from {table_name}: {[f'{m}/{y}' for y, m in latest_periods[:3]]}")
             except Exception as e:
                 logger.warning(f"Could not initialize latest periods: {e}")
 
@@ -715,12 +689,9 @@ class NLQSystem:
             sql_source = "cache" if cached_sql else None
             if cached_sql:
                 sql = cached_sql
-                logger.info("Using cached SQL")
             else:
                 # LLM-first generation with rule-based fallback (configurable)
                 if getattr(config.system, "prefer_llm_first", True):
-                    logger.info("🤖 Attempting LLM-first SQL generation")
-                    logger.debug(f"📝 Processing query: '{nlq[:100]}{'...' if len(nlq) > 100 else ''}'")
 
                     try:
                         # Update latest periods in LLM manager before generating prompt
@@ -733,28 +704,23 @@ class NLQSystem:
 
                         table_info = self.db_manager.get_table_info(table_name)
                         prompt = self.llm_manager.build_enhanced_prompt(nlq, table_info)
-                        logger.debug(f"📋 Generated prompt with {len(prompt)} characters")
 
                         sql = self.llm_manager.generate_sql(prompt)
 
                         if sql:
                             used_llm = True
                             sql_source = "llm"
-                            logger.info("✅ LLM successfully generated SQL")
-                            logger.debug(f"🔍 LLM-generated SQL: {sql[:200]}{'...' if len(sql) > 200 else ''}")
                         else:
                             used_llm = False
                             sql_source = "rules"
-                            logger.warning("⚠️ LLM SQL generation returned None; falling back to rule-based pipeline")
-                            logger.info("🔄 Switching to rule-based intent pipeline")
+                            logger.warning("LLM SQL generation failed; falling back to rule-based pipeline")
                             sql = self._generate_sql_pipeline(nlq, table_name)
 
                     except Exception as llm_error:
                         used_llm = False
                         sql_source = "rules"
                         error_type = type(llm_error).__name__
-                        logger.error(f"❌ LLM generation failed with {error_type}: {llm_error}")
-                        logger.info("🔄 Switching to rule-based intent pipeline due to LLM error")
+                        logger.error(f"LLM generation failed with {error_type}: {llm_error}")
                         sql = self._generate_sql_pipeline(nlq, table_name)
                 else:
                     # Legacy pipeline (rule-based first)
@@ -767,7 +733,6 @@ class NLQSystem:
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
             if cached_result:
-                logger.info("Using cached result")
                 self.metrics.cache_hits += 1
                 cached_result.data = self._sanitize_dataframe(cached_result.data)
                 return cached_result
@@ -777,7 +742,6 @@ class NLQSystem:
                 result = self._execute_with_repair(sql, nlq, table_name)
             except Exception as exec_err:
                 if getattr(config.system, "fallback_on_exec_error", True) and sql_source != "rules":
-                    logger.info("Execution failed for LLM SQL; attempting rule-based fallback execution")
                     fallback_sql = self._build_rule_based_fallback(nlq, table_name)
                     if fallback_sql and fallback_sql.strip() and fallback_sql.strip() != sql.strip():
                         fallback_sql = self._post_process_sql(fallback_sql, nlq, table_name)
@@ -796,7 +760,6 @@ class NLQSystem:
                 result.summary_text = summary
             elif getattr(config.system, "fallback_on_empty_result", True) and sql_source == "llm":
                 # Empty results from LLM SQL: try rule-based fallback once
-                logger.info("LLM SQL returned empty result; trying rule-based fallback")
                 fallback_sql = self._build_rule_based_fallback(nlq, table_name)
                 if fallback_sql and fallback_sql.strip() and fallback_sql.strip() != sql.strip():
                     fallback_sql = self._post_process_sql(fallback_sql, nlq, table_name)
@@ -847,7 +810,6 @@ class NLQSystem:
         else:
             # Generate SQL from intent
             sql = self.sql_generator.build_sql_from_intent(intent, table_name)
-            logger.info(f"Generated SQL with LIMIT {intent.limit} for query: {nlq[:50]}...")
 
         if not sql:
             raise ValueError("All SQL generation methods failed")
@@ -855,7 +817,6 @@ class NLQSystem:
         # Cache generated SQL
         self.cache.cache_sql(nlq, sql)
 
-        logger.info(f"Final SQL for query '{nlq[:50]}...': {sql}")
         return sql
 
     def _post_process_sql(self, sql: str, nlq: str, table_name: str) -> str:
@@ -874,7 +835,6 @@ class NLQSystem:
                 return self.db_manager.execute_query(sql)
         except Exception as exec_err:
             if self._is_repairable_error(exec_err):
-                logger.info("Attempting SQL repair after execution error")
                 repaired_sql = self._repair_sql_errors(sql, table_name)
                 if repaired_sql and repaired_sql != sql:
                     with memory_monitor.monitor_operation("Query execution (repaired)"):
@@ -946,7 +906,6 @@ class NLQSystem:
         self.metrics.memory_peak_mb = max(self.metrics.memory_peak_mb, result.memory_usage_mb)
 
         total_time = time.time() - start_time
-        logger.info(".3f")
 
     def _normalize_sql_table_name(self, sql: str, expected_table: str) -> str:
         """Ensure SQL references the correct table name."""

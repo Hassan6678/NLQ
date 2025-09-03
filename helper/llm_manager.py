@@ -89,12 +89,8 @@ class LLMManager:
     def _load_model(self) -> None:
         """Load main SQL model and summarizer model with enhanced error handling."""
         try:
-            logger.info(f"Loading SQL generation model: {self._model_config.model_path}")
-
             if not os.path.exists(self._model_config.model_path):
                 raise FileNotFoundError(f"Model file not found: {self._model_config.model_path}")
-
-            start_time = time.time()
 
             # Load main SQL model
             self.llm = Llama(
@@ -105,14 +101,10 @@ class LLMManager:
                 verbose=self._model_config.verbose,
             )
 
-            load_time = time.time() - start_time
-            logger.info(".2f")
-
             # Load summarizer model if available
             self._load_summarizer_model()
 
             self.model_loaded = True
-            logger.info("LLM Manager initialized successfully")
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
@@ -121,7 +113,6 @@ class LLMManager:
     def _load_summarizer_model(self) -> None:
         """Load summarizer model with fallback to main model."""
         if not self._model_config.summarizer_model_path:
-            logger.info("No summarizer model configured, using main model for summarization")
             self.summarizer_llm = self.llm
             return
 
@@ -129,9 +120,6 @@ class LLMManager:
             if os.path.exists(self._model_config.summarizer_model_path) and (
                 self._model_config.summarizer_model_path != self._model_config.model_path
             ):
-                logger.info(f"Loading summarizer model: {self._model_config.summarizer_model_path}")
-                start_time = time.time()
-
                 self.summarizer_llm = Llama(
                     model_path=self._model_config.summarizer_model_path,
                     n_ctx=max(self._model_config.n_ctx, 2048),
@@ -139,11 +127,7 @@ class LLMManager:
                     n_gpu_layers=self._model_config.n_gpu_layers,
                     verbose=False,
                 )
-
-                load_time = time.time() - start_time
-                logger.info(".2f")
             else:
-                logger.warning("Summarizer model path not found or same as main model")
                 self.summarizer_llm = self.llm
 
         except Exception as e:
@@ -437,14 +421,12 @@ class LLMManager:
             logger.error("❌ LLM generation failed: Invalid prompt provided")
             raise ValueError("Invalid prompt provided")
 
-        # Track attempt and log details
+        # Track attempt
         self.failure_stats["total_attempts"] += 1
-        prompt_length = len(prompt) if prompt else 0
-        logger.debug(f"🤖 Starting LLM SQL generation (attempt #{self.failure_stats['total_attempts']}) with prompt length: {prompt_length} chars")
 
         try:
             # Calculate dynamic max tokens based on prompt length and context window
-            prompt_tokens = prompt_length // 4  # Rough estimate
+            prompt_tokens = len(prompt) // 4 if prompt else 0
             remaining_tokens = self._model_config.n_ctx - prompt_tokens - 100  # Reserve 100 tokens for safety
             dynamic_max_tokens = min(self._model_config.max_tokens, max(512, remaining_tokens))
 
@@ -452,8 +434,6 @@ class LLMManager:
                 error_msg = f"Insufficient context space for SQL generation (remaining: {remaining_tokens} tokens)"
                 self._record_failure("context_window", error_msg)
                 return None
-
-            logger.debug(f"📏 Using dynamic max_tokens: {dynamic_max_tokens} (remaining context: {remaining_tokens} tokens)")
 
             output = self.llm(
                 prompt,
@@ -475,7 +455,6 @@ class LLMManager:
             )
 
             raw_text = output["choices"][0]["text"]
-            logger.debug(f"✅ LLM responded with {len(raw_text)} characters")
 
             # Check if we got a meaningful response
             if not raw_text or len(raw_text.strip()) == 0:
@@ -484,35 +463,28 @@ class LLMManager:
 
             # Check for common failure patterns
             if any(phrase in raw_text.lower() for phrase in ["i don't know", "i cannot", "i'm sorry", "unable to"]):
-                logger.warning(f"⚠️ LLM indicated uncertainty in response: {raw_text[:100]}...")
+                logger.warning("LLM indicated uncertainty in response")
                 # Don't fail here, let SQL extraction handle it
 
             # Enhanced validation: Check if response looks like it could be SQL
             raw_text_stripped = raw_text.strip()
             if not raw_text_stripped.upper().startswith("SELECT") and not raw_text_stripped[0].isupper():
-                logger.warning(f"⚠️ LLM response doesn't start with SELECT: '{raw_text_stripped[:100]}...'")
                 # Try to fix incomplete responses by prepending SELECT
                 if raw_text_stripped and not raw_text_stripped.upper().startswith(("SELECT", "FROM", "WHERE", "GROUP", "ORDER")):
-                    logger.info("🔧 Attempting to fix incomplete SQL by prepending SELECT")
                     raw_text = f"SELECT {raw_text}"
 
             result = self._extract_and_validate_sql(raw_text)
             if result:
                 self.failure_stats["successful_generations"] += 1
-                logger.info(f"✅ LLM generation successful (success rate: {self.failure_stats['successful_generations']}/{self.failure_stats['total_attempts']})")
-                logger.debug(f"🎯 Final SQL: {result[:200]}{'...' if len(result) > 200 else ''}")
             else:
                 # Try to fix incomplete SQL with a focused retry
-                logger.warning("⚠️ Initial SQL extraction failed, attempting repair...")
                 fixed_result = self._try_fix_incomplete_sql(raw_text)
                 if fixed_result:
                     result = fixed_result
                     self.failure_stats["successful_generations"] += 1
-                    logger.info("✅ SQL repair successful!")
-                    logger.debug(f"🎯 Repaired SQL: {result[:200]}{'...' if len(result) > 200 else ''}")
                 else:
                     self._record_failure("validation_error", "SQL extraction/validation failed")
-                    logger.error(f"❌ Failed to extract valid SQL from: '{raw_text[:200]}...'")
+                    logger.error("Failed to extract valid SQL from LLM response")
 
             return result
 
@@ -567,30 +539,21 @@ class LLMManager:
 
             text = text.strip()
             if not text:
-                logger.error("❌ SQL extraction failed: Text is empty after stripping")
                 return None
-
-            logger.debug(f"🔍 Extracting SQL from LLM response (length: {len(text)} chars)")
-            logger.debug(f"📄 LLM Response preview: {text[:200]}...")
 
             # Ensure SELECT is present - more flexible approach
             if "SELECT" not in text.upper():
                 text_stripped = text.strip()
                 if text_stripped.startswith(("FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "JOIN")):
-                    logger.info("🔧 Adding missing SELECT keyword to LLM response")
                     text = "SELECT " + text
                 elif "," in text_stripped and ("FROM" in text_stripped.upper() or "WHERE" in text_stripped.upper()):
                     # Looks like column list without SELECT
-                    logger.info("🔧 Detected column list without SELECT, adding SELECT")
                     text = "SELECT " + text
                 elif text_stripped and not text_stripped[0].isupper() and len(text_stripped.split()) > 2:
                     # Looks like partial SQL starting with lowercase
-                    logger.info("🔧 Detected partial SQL response, attempting to complete")
                     text = "SELECT " + text
                 else:
-                    logger.error("❌ SQL extraction failed: No SELECT keyword found in response")
-                    logger.error(f"💡 Response: '{text[:100]}...'")
-                    logger.error("💡 Expected format: SQL statement starting with SELECT")
+                    logger.error("SQL extraction failed: No SELECT keyword found in response")
                     return None
 
             text_upper = text.upper()
@@ -599,9 +562,8 @@ class LLMManager:
             if "SELECT" in text_upper:
                 sql_start = text_upper.find("SELECT")
                 sql_text = text[sql_start:]
-                logger.debug(f"✅ Found SELECT at position {sql_start}")
             else:
-                logger.error("❌ SQL extraction failed: Could not locate SELECT statement")
+                logger.error("SQL extraction failed: Could not locate SELECT statement")
                 return None
 
             # Find SQL end using multiple delimiters
@@ -619,34 +581,25 @@ class LLMManager:
                 "</s>",
             ]
 
-            found_delimiter = None
             for delimiter in delimiters:
                 pos = lower_sql_text.find(delimiter)
                 if pos != -1:
                     sql_end = min(sql_end, pos)
-                    found_delimiter = delimiter
                     break
 
             sql = sql_text[:sql_end].strip()
-            logger.debug(f"📝 Extracted SQL (length: {len(sql)} chars, ended with: '{found_delimiter or 'EOF'}')")
 
             # Ensure semicolon
             if not sql.endswith(";"):
                 sql += ";"
-                logger.debug("🔧 Added missing semicolon to SQL")
-
-            # Log the extracted SQL for debugging
-            logger.debug(f"🔍 Extracted SQL: {sql}")
 
             # Validate SQL
             validation = self._validate_sql_syntax(sql)
             if validation.is_valid:
                 final_sql = validation.sanitized_sql or sql
-                logger.info(f"✅ SQL validation passed - final SQL length: {len(final_sql)} chars")
                 return final_sql
 
-            logger.error(f"❌ SQL extraction failed: Validation error - {validation.error_message}")
-            logger.error(f"💡 Invalid SQL: {sql}")
+            logger.error(f"SQL validation failed: {validation.error_message}")
             return None
 
         except Exception as e:
@@ -898,11 +851,9 @@ class LLMManager:
         """Attempt to fix incomplete or malformed SQL responses."""
         try:
             text = raw_text.strip()
-            logger.debug(f"🔧 Attempting to repair SQL: '{text[:100]}...'")
 
             # Case 1: Response starts with column names (like "city, SUM(sales)")
             if "," in text[:50] and any(keyword in text.upper() for keyword in ["FROM", "WHERE", "GROUP", "ORDER"]):
-                logger.info("🔧 Case 1: Detected column list, constructing complete SQL")
                 # Try to extract components
                 parts = text.split()
                 from_idx = next((i for i, part in enumerate(parts) if part.upper() == "FROM"), -1)
@@ -912,12 +863,10 @@ class LLMManager:
                     fixed_sql = f"SELECT {columns} {rest}"
                     if not fixed_sql.endswith(";"):
                         fixed_sql += ";"
-                    logger.info(f"🔧 Fixed SQL: {fixed_sql}")
                     return fixed_sql
 
             # Case 2: Missing SELECT but has FROM clause
             if text.upper().startswith(("FROM", "WHERE")):
-                logger.info("🔧 Case 2: Missing SELECT keyword")
                 fixed_sql = f"SELECT * {text}"
                 if not fixed_sql.endswith(";"):
                     fixed_sql += ";"
@@ -927,7 +876,6 @@ class LLMManager:
             if text and not text[0].isupper() and len(text.split()) >= 3:
                 # Check if it looks like a column aggregation pattern
                 if any(agg in text.upper() for agg in ["SUM(", "COUNT(", "AVG(", "MAX(", "MIN("]):
-                    logger.info("🔧 Case 3: Detected aggregation pattern, adding SELECT")
                     fixed_sql = f"SELECT {text}"
                     if not fixed_sql.endswith(";"):
                         fixed_sql += ";"
@@ -935,7 +883,6 @@ class LLMManager:
 
             # Case 4: Try to append missing components
             if "FROM" in text.upper() and not text.upper().startswith("SELECT"):
-                logger.info("🔧 Case 4: Has FROM but missing SELECT")
                 # Look for table name after FROM
                 from_match = text.upper().find("FROM")
                 table_part = text[from_match:]
@@ -944,7 +891,6 @@ class LLMManager:
                     fixed_sql += ";"
                 return fixed_sql
 
-            logger.warning("🔧 Could not repair SQL - unsupported pattern")
             return None
 
         except Exception as e:
@@ -978,16 +924,6 @@ class LLMManager:
                 "timestamp": self.failure_stats["last_failure_time"]
             }
         }
-
-    def update_latest_periods(self, latest_periods: List[Tuple[int, int]]) -> None:
-        """
-        Update the latest periods information for use in prompts and context.
-
-        Args:
-            latest_periods: List of tuples containing (year, month) for latest periods
-        """
-        self.latest_periods = latest_periods
-        logger.debug(f"📅 Updated latest periods in LLM manager: {[f'{m}/{y}' for y, m in latest_periods[:3]]}")
 
     def is_ready(self) -> bool:
         """Check if the LLM manager is ready for use."""
