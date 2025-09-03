@@ -31,7 +31,7 @@ def setup_logging():
     logs_dir.mkdir(exist_ok=True)
     
     # Use single log file per session (not per run)
-    log_file = logs_dir / 'app_session.log'
+    log_file = logs_dir / 'app.log'
     
     utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
