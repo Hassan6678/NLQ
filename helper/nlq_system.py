@@ -685,7 +685,6 @@ class NLQSystem:
 
             # Check cache first
             cached_sql = self.cache.get_cached_sql(nlq)
-            used_llm = False
             sql_source = "cache" if cached_sql else None
             if cached_sql:
                 sql = cached_sql
@@ -705,20 +704,36 @@ class NLQSystem:
                         table_info = self.db_manager.get_table_info(table_name)
                         prompt = self.llm_manager.build_enhanced_prompt(nlq, table_info)
 
-                        sql = self.llm_manager.generate_sql(prompt)
+                        # Add 3-minute timeout for LLM generation
+                        start_time = time.time()
+                        sql = None
+
+                        try:
+                            sql = self.llm_manager.generate_sql(prompt)
+                            elapsed_time = time.time() - start_time
+
+                            # Check if LLM took too long
+                            if elapsed_time > 180:  # 3 minutes = 180 seconds
+                                logger.warning(f"⏰ LLM generation exceeded 3-minute timeout ({elapsed_time:.2f}s), forcing fallback to rule-based engine")
+                                sql = None  # Force fallback to rule-based
+
+                        except Exception as llm_error:
+                            elapsed_time = time.time() - start_time
+                            if elapsed_time > 180:
+                                logger.warning(f"⏰ LLM generation timed out after {elapsed_time:.2f} seconds")
+                                raise TimeoutError(f"LLM generation timed out after {elapsed_time:.2f} seconds")
+                            else:
+                                raise llm_error
 
                         if sql:
-                            used_llm = True
                             sql_source = "llm"
                             logger.info("🔍 Query processed using LLM engine")
                         else:
-                            used_llm = False
                             sql_source = "rules"
                             logger.info("🔍 Query processed using rule-based engine (LLM failed)")
                             sql = self._generate_sql_pipeline(nlq, table_name)
 
                     except Exception as llm_error:
-                        used_llm = False
                         sql_source = "rules"
                         error_type = type(llm_error).__name__
                         logger.error(f"LLM generation failed with {error_type}: {llm_error}")
