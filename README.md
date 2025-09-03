@@ -98,6 +98,11 @@ n_gpu_layers = 20          # GPU layers (if available)
 enable_query_cache = True   # Cache generated SQL
 enable_result_cache = True  # Cache query results
 cache_ttl = 3600           # Cache time-to-live (seconds)
+
+# Strategy and fallbacks
+prefer_llm_first = True         # Try LLM-based SQL first
+fallback_on_exec_error = True   # If LLM SQL fails to execute, try rule-based
+fallback_on_empty_result = True # If LLM SQL returns empty, try rule-based
 ```
 
 ### Environment Variables
