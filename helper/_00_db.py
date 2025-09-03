@@ -90,30 +90,7 @@ class DatabaseManager:
 			if not hasattr(self.local, "conn") or self.local.conn is None:
 				self.local.conn = self._init_connection()
 				logger.debug(f"Created new DuckDB connection for thread {threading.get_ident()}")
-			else:
-				# Validate connection is still alive
-				try:
-					self.local.conn.execute("SELECT 1").fetchone()
-				except Exception as e:
-					logger.warning(f"Connection became invalid, recreating: {e}")
-					try:
-						self.local.conn.close()
-					except:
-						pass
-					self.local.conn = self._init_connection()
-					logger.debug(f"Recreated DuckDB connection for thread {threading.get_ident()}")
-			try:
-				yield self.local.conn
-			except Exception as e:
-				# If connection fails, mark it for recreation
-				logger.warning(f"Connection error during use: {e}")
-				try:
-					if hasattr(self.local, "conn"):
-						self.local.conn.close()
-				except:
-					pass
-				self.local.conn = None
-				raise
+			yield self.local.conn
 		return _gen()
 
 	def close_all(self):
@@ -125,21 +102,6 @@ class DatabaseManager:
 			except Exception:
 				pass
 			self.local.conn = None
-
-	def invalidate_all_connections(self):
-		"""Force recreation of all connections (after database deletion/recreation)."""
-		if hasattr(self.local, "conn") and self.local.conn is not None:
-			try:
-				self.local.conn.close()
-			except Exception:
-				pass
-			self.local.conn = None
-		logger.info("Invalidated all connections due to database change")
-
-	def clear_schema_cache(self):
-		"""Clear all cached table schemas."""
-		self.table_schemas.clear()
-		logger.info("Cleared all cached table schemas")
 
 
 	def _quote_identifier(self, name: str) -> str:
@@ -268,35 +230,19 @@ class DatabaseManager:
 			return "VARCHAR"
 
 	def _create_indexes(self, conn, table_name: str):
-		"""Create indexes on commonly queried columns with better error handling."""
-		index_success_count = 0
-		index_error_count = 0
-
 		try:
 			result = conn.execute(f"DESCRIBE {table_name}").fetchall()
 			columns = [row[0] for row in result]
-
 			for col in columns:
 				col_lower = col.lower()
 				if any(p in col_lower for p in ['id','date','time','region','category','type','month','year','city','brand','sku','customer','territory','route','area','distributor']):
 					try:
 						conn.execute(f"CREATE INDEX idx_{table_name}_{col} ON {table_name}({col})")
-						logger.info(f"✅ Created index on {table_name}.{col}")
-						index_success_count += 1
+						logger.debug(f"Created index on {table_name}.{col}")
 					except Exception as e:
-						logger.warning(f"⚠️ Could not create index on {col}: {e}")
-						index_error_count += 1
-
-			logger.info(f"Index creation completed: {index_success_count} successful, {index_error_count} failed")
-
-			# If many indexes failed, it might indicate a data quality issue
-			if index_error_count > index_success_count and index_error_count > 0:
-				logger.error(f"⚠️ High number of index creation failures ({index_error_count}) - check data quality")
-
+						logger.debug(f"Could not create index on {col}: {e}")
 		except Exception as e:
-			logger.error(f"❌ Error during index creation process: {e}")
-			# Don't fail the entire operation for index creation issues
-			logger.info("Continuing without indexes - performance may be affected")
+			logger.warning(f"Error creating indexes: {e}")
 
 	# Time helpers
 	def get_latest_periods(self, table_name: str, limit: int = 2) -> List[Tuple[int, int]]:
@@ -371,94 +317,44 @@ class DatabaseManager:
 			return False
 
 	def _coerce_chunk_dtypes(self, chunk: pd.DataFrame) -> pd.DataFrame:
-		"""Coerce data types with improved error handling and logging."""
 		try:
 			coerced = chunk.copy()
-			conversion_summary = {"successful": 0, "failed": 0, "warnings": []}
-
 			boolean_candidates = {"productivity", "stockout", "assortment"}
-
 			for col in coerced.columns:
-				try:
-					series = coerced[col]
-					original_dtype = series.dtype
-
-					if col.lower() in {"month", "year"}:
-						try:
-							coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
-							conversion_summary["successful"] += 1
-							logger.debug(f"Converted {col} from {original_dtype} to Int64")
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed to convert {col} to Int64: {e}")
-							conversion_summary["failed"] += 1
+				series = coerced[col]
+				if col.lower() in {"month", "year"}:
+					coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
+					continue
+				if col.lower() in boolean_candidates:
+					str_vals = series.astype(str).str.strip().str.lower()
+					true_set = {"true","1","yes","y","t"}
+					false_set = {"false","0","no","n","f"}
+					mapped = str_vals.map(lambda v: 1 if v in true_set else (0 if v in false_set else pd.NA))
+					if mapped.notna().mean() > 0.9:
+						coerced[col] = mapped.astype("Int64")
 						continue
-
-					if col.lower() in boolean_candidates:
-						try:
-							str_vals = series.astype(str).str.strip().str.lower()
-							true_set = {"true","1","yes","y","t"}
-							false_set = {"false","0","no","n","f"}
-							mapped = str_vals.map(lambda v: 1 if v in true_set else (0 if v in false_set else pd.NA))
-							if mapped.notna().mean() > 0.9:
-								coerced[col] = mapped.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-							numeric = pd.to_numeric(series, errors="coerce")
-							if numeric.notna().mean() > 0.9 and set(numeric.dropna().unique()).issubset({0,1}):
-								coerced[col] = numeric.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-							if pd.api.types.is_bool_dtype(series):
-								coerced[col] = series.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed boolean conversion for {col}: {e}")
-							conversion_summary["failed"] += 1
-
+					numeric = pd.to_numeric(series, errors="coerce")
+					if numeric.notna().mean() > 0.9 and set(numeric.dropna().unique()).issubset({0,1}):
+						coerced[col] = numeric.astype("Int64")
+						continue
 					if pd.api.types.is_bool_dtype(series):
+						coerced[col] = series.astype("Int64")
 						continue
-					if pd.api.types.is_numeric_dtype(series):
-						continue
-
-					if pd.api.types.is_object_dtype(series):
-						try:
-							cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
-							numeric = pd.to_numeric(cleaned, errors="coerce")
-							non_null_ratio = numeric.notna().mean()
-							if non_null_ratio > 0.9:
-								if (numeric.dropna() % 1 == 0).all():
-									coerced[col] = numeric.astype("Int64")
-									conversion_summary["successful"] += 1
-									logger.debug(f"Converted {col} from string to Int64")
-								else:
-									coerced[col] = numeric.astype("float64")
-									conversion_summary["successful"] += 1
-									logger.debug(f"Converted {col} from string to float64")
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed numeric conversion for {col}: {e}")
-							conversion_summary["failed"] += 1
-
-				except Exception as e:
-					conversion_summary["warnings"].append(f"Unexpected error processing column {col}: {e}")
-					conversion_summary["failed"] += 1
-
-			# Log conversion summary
-			total_conversions = conversion_summary["successful"] + conversion_summary["failed"]
-			if total_conversions > 0:
-				logger.info(f"Data type conversion: {conversion_summary['successful']}/{total_conversions} successful")
-
-			if conversion_summary["warnings"]:
-				for warning in conversion_summary["warnings"][:3]:  # Log first 3 warnings
-					logger.warning(warning)
-				if len(conversion_summary["warnings"]) > 3:
-					logger.warning(f"... and {len(conversion_summary['warnings']) - 3} more conversion warnings")
-
+				if pd.api.types.is_bool_dtype(series):
+					continue
+				if pd.api.types.is_numeric_dtype(series):
+					continue
+				if pd.api.types.is_object_dtype(series):
+					cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
+					numeric = pd.to_numeric(cleaned, errors="coerce")
+					non_null_ratio = numeric.notna().mean()
+					if non_null_ratio > 0.9:
+						if (numeric.dropna() % 1 == 0).all():
+							coerced[col] = numeric.astype("Int64")
+						else:
+							coerced[col] = numeric.astype("float64")
 			return coerced
-
-		except Exception as e:
-			logger.error(f"Critical error in data type coercion: {e}")
-			logger.warning("Falling back to original chunk without type coercion")
+		except Exception:
 			return chunk
 
 	def execute_query(self, sql: str) -> QueryResult:
