@@ -13,12 +13,12 @@ import psutil
 @dataclass
 class DatabaseConfig:
     """Database configuration settings."""
-    connection_pool_size: int = 5
-    chunk_size: int = 50000
-    memory_limit: str = "2GB"
-    threads: int = 4
+    connection_pool_size: int = 20  # Increased for high-performance systems
+    chunk_size: int = 500000  # Much larger chunks for 500GB RAM systems
+    memory_limit: str = "200GB"  # Optimized for 500GB RAM
+    threads: int = 64  # Optimized for 96-core CPU
     enable_parallel: bool = True
-    cache_size: str = "512MB"
+    cache_size: str = "50GB"  # Large cache for performance
     db_path: str = "nlq.duckdb"
 
 
@@ -27,14 +27,14 @@ class ModelConfig:
     """LLM model configuration settings."""
     model_path: str = "models/llama-3-sqlcoder-8b.Q6_K.gguf"
     summarizer_model_path: str = "models/Mistral-7B-Instruct-v0.1.Q6_K.gguf"
-    n_ctx: int = 2048
-    n_threads: int = 16
-    n_gpu_layers: int = 0  # Changed from 20 to 0 - DISABLES GPU/CUDA
+    n_ctx: int = 8192  # Increased for powerful hardware - supports complex queries
+    n_threads: int = 88  # Optimized for 96-core systems
+    n_gpu_layers: int = 0  # CPU-only for maximum compatibility
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 1024  # Increased for detailed SQL generation
     verbose: bool = False
     summarizer_temperature: float = 0.2
-    summarizer_max_tokens: int = 384
+    summarizer_max_tokens: int = 768  # Increased for better summaries
 
 
 @dataclass
@@ -61,11 +61,15 @@ class LoggingConfig:
 @dataclass
 class SystemConfig:
     """System and performance configuration."""
-    max_memory_usage: float = 0.8  # 80% of available RAM
+    max_memory_usage: float = 0.9  # 90% of available RAM for high-end systems
     enable_profiling: bool = False
     profiling_output_dir: str = "profiling"
     enable_monitoring: bool = True
     health_check_interval: int = 60  # seconds
+    # NLQ strategy and fallbacks
+    prefer_llm_first: bool = True
+    fallback_on_exec_error: bool = True
+    fallback_on_empty_result: bool = True
 
 
 class Config:
@@ -93,28 +97,61 @@ class Config:
         # Get system memory
         memory_gb = psutil.virtual_memory().total / (1024**3)
         cpu_count = psutil.cpu_count()
-        
-        # Adjust database settings based on memory
-        if memory_gb < 8:
+
+        # Force high-performance settings for powerful hardware (96 cores, 500GB RAM)
+        if memory_gb >= 500:  # High-end workstation/server
+            print("🎯 Detected high-end hardware! Optimizing for maximum performance...")
+
+            # Database optimizations for 500GB RAM
+            self.database.chunk_size = 500000  # Much larger chunks for speed
+            self.database.memory_limit = "200GB"  # Use significant portion of RAM
+            self.database.cache_size = "50GB"    # Large cache for performance
+            self.database.threads = min(cpu_count - 4, 64)  # Use most cores, keep 4 free
+            self.database.connection_pool_size = 20  # More connections
+
+            # Model optimizations for 96 cores
+            self.model.n_ctx = 8192  # Much larger context window for complex queries
+            self.model.n_threads = min(cpu_count - 8, 88)  # Use most cores, keep 8 free
+            self.model.max_tokens = 1024  # Larger output for detailed SQL
+            self.model.summarizer_max_tokens = 768  # Larger summaries
+            self.model.n_gpu_layers = 0  # CPU-only for this configuration
+
+            # System optimizations
+            self.system.max_memory_usage = 0.9  # Use 90% of RAM
+
+            print("🚀 High-performance configuration applied!")
+            print(f"   • Context window: {self.model.n_ctx} tokens")
+            print(f"   • Model threads: {self.model.n_threads} cores")
+            print(f"   • Database threads: {self.database.threads}")
+            print(f"   • Memory limit: {self.database.memory_limit}")
+            print(f"   • Chunk size: {self.database.chunk_size:,} rows")
+
+        elif memory_gb >= 64:  # Professional workstation
+            self.database.chunk_size = 250000
+            self.database.memory_limit = "32GB"
+            self.database.cache_size = "8GB"
+            self.model.n_ctx = 6144
+            self.model.n_threads = min(cpu_count - 4, 48)
+            self.database.threads = min(cpu_count // 2, 32)
+        elif memory_gb >= 16:
+            self.database.chunk_size = 100000
+            self.database.memory_limit = "8GB"
+            self.database.cache_size = "2GB"
+            self.model.n_ctx = 4096
+            self.model.n_threads = min(cpu_count // 2, 24)
+            self.database.threads = min(cpu_count // 2, 16)
+        else:  # Low memory systems
             self.database.chunk_size = 25000
             self.database.memory_limit = "1GB"
             self.database.cache_size = "256MB"
-            self.model.n_ctx = 1024
-            self.model.n_gpu_layers = 0  # Always use CPU for low memory systems - changed from 35
-        elif memory_gb >= 16:
-            self.database.chunk_size = 100000
-            self.database.memory_limit = "4GB"
-            self.database.cache_size = "1GB"
-            self.model.n_ctx = 4096
-            self.model.n_gpu_layers = 0  # Force CPU usage - changed from 35
-        
-        # Adjust threading based on CPU - limit to prevent system overload
-        self.database.threads = min(cpu_count // 2, 24)  # Use half CPU cores, max 8
-        self.model.n_threads = min(cpu_count // 2, 64)   # Use half CPU cores, max 12
+            self.model.n_ctx = 2048
+            self.model.n_threads = min(cpu_count // 4, 8)
+            self.database.threads = min(cpu_count // 4, 4)
 
-        print(f"Auto-configured for {memory_gb:.1f}GB RAM, {cpu_count} CPUs")
-        print(f"CPU-only mode: GPU layers = {self.model.n_gpu_layers}")
-        print(f"Limited CPU usage: Model threads = {self.model.n_threads}, DB threads = {self.database.threads}")
+        print(f"✅ Auto-configured for {memory_gb:.1f}GB RAM, {cpu_count} CPUs")
+        print(f"   • Context window: {self.model.n_ctx} tokens")
+        print(f"   • Model threads: {self.model.n_threads}")
+        print(f"   • Database threads: {self.database.threads}")
     
     def _load_from_env(self):
         """Load configuration from environment variables."""
