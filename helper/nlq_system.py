@@ -710,10 +710,11 @@ class NLQSystem:
                         if sql:
                             used_llm = True
                             sql_source = "llm"
+                            logger.info("🔍 Query processed using LLM engine")
                         else:
                             used_llm = False
                             sql_source = "rules"
-                            logger.warning("LLM SQL generation failed; falling back to rule-based pipeline")
+                            logger.info("🔍 Query processed using rule-based engine (LLM failed)")
                             sql = self._generate_sql_pipeline(nlq, table_name)
 
                     except Exception as llm_error:
@@ -721,11 +722,13 @@ class NLQSystem:
                         sql_source = "rules"
                         error_type = type(llm_error).__name__
                         logger.error(f"LLM generation failed with {error_type}: {llm_error}")
+                        logger.info("🔍 Query processed using rule-based engine (LLM error)")
                         sql = self._generate_sql_pipeline(nlq, table_name)
                 else:
                     # Legacy pipeline (rule-based first)
                     sql = self._generate_sql_pipeline(nlq, table_name)
                     sql_source = "rules"
+                    logger.info("🔍 Query processed using rule-based engine (legacy mode)")
 
             # Post-processing pipeline
             sql = self._post_process_sql(sql, nlq, table_name)
@@ -733,7 +736,6 @@ class NLQSystem:
             # Check result cache
             cached_result = self.cache.get_cached_result(sql)
             if cached_result:
-                self.metrics.cache_hits += 1
                 cached_result.data = self._sanitize_dataframe(cached_result.data)
                 return cached_result
 
@@ -902,7 +904,6 @@ class NLQSystem:
         """Update performance metrics."""
         self.metrics.query_count += 1
         self.metrics.total_execution_time += result.execution_time
-        self.metrics.cache_misses += 1
         self.metrics.memory_peak_mb = max(self.metrics.memory_peak_mb, result.memory_usage_mb)
 
         total_time = time.time() - start_time
@@ -997,101 +998,3 @@ class NLQSystem:
 
         return sql
 
-    def cancel_running_query(self) -> bool:
-        """Cancel currently running query."""
-        return self.db_manager.cancel_query_for_thread()
-
-    def get_performance_report(self) -> Dict[str, Any]:
-        """Generate comprehensive performance report."""
-        cache_hit_rate = (self.cache.cache_stats["hits"] /
-                         max(1, self.cache.cache_stats["hits"] + self.cache.cache_stats["misses"]))
-
-        avg_execution_time = (self.metrics.total_execution_time /
-                             max(1, self.metrics.query_count))
-
-        # Get LLM failure statistics
-        llm_stats = self.llm_manager.get_failure_stats()
-
-        return {
-            "query_metrics": {
-                "total_queries": self.metrics.query_count,
-                "total_execution_time": self.metrics.total_execution_time,
-                "average_execution_time": avg_execution_time,
-                "errors": self.metrics.errors
-            },
-            "cache_metrics": {
-                "hit_rate": cache_hit_rate,
-                "total_hits": self.cache.cache_stats["hits"],
-                "total_misses": self.cache.cache_stats["misses"]
-            },
-            "memory_metrics": {
-                "peak_usage_mb": self.metrics.memory_peak_mb,
-                "current_usage_mb": memory_monitor.get_memory_usage(),
-            },
-            "llm_metrics": {
-                "llm_success_rate": llm_stats["success_rate_percent"],
-                "llm_total_attempts": llm_stats["total_attempts"],
-                "llm_failures": llm_stats["total_failures"],
-                "llm_failure_breakdown": llm_stats["failure_breakdown"],
-                "last_llm_failure": llm_stats["last_failure"]["reason"] if llm_stats["last_failure"]["reason"] else None
-            },
-            "loaded_tables": {
-                name: {"rows": info["total_rows"]}
-                for name, info in self.loaded_tables.items()
-            }
-        }
-
-    def get_llm_health_status(self) -> Dict[str, Any]:
-        """Get detailed LLM health and failure analysis."""
-        llm_stats = self.llm_manager.get_failure_stats()
-
-        # Analyze failure patterns
-        failure_analysis = {}
-        if llm_stats["total_attempts"] > 0:
-            for failure_type, count in llm_stats["failures"].items():
-                if count > 0:
-                    percentage = (count / llm_stats["total_attempts"]) * 100
-                    failure_analysis[failure_type] = {
-                        "count": count,
-                        "percentage": round(percentage, 2)
-                    }
-
-        return {
-            "llm_ready": self.llm_manager.is_ready(),
-            "model_info": self.llm_manager.get_model_info(),
-            "performance": {
-                "success_rate": llm_stats["success_rate_percent"],
-                "total_attempts": llm_stats["total_attempts"],
-                "successful": llm_stats["successful_generations"],
-                "failed": llm_stats["total_failures"]
-            },
-            "failure_analysis": failure_analysis,
-            "last_failure": llm_stats["last_failure"],
-            "recommendations": self._get_llm_troubleshooting_recommendations(llm_stats)
-        }
-
-    def _get_llm_troubleshooting_recommendations(self, stats: Dict[str, Any]) -> List[str]:
-        """Generate troubleshooting recommendations based on failure patterns."""
-        recommendations = []
-
-        if stats["success_rate_percent"] < 50:
-            recommendations.append("⚠️ Low success rate - consider adjusting model parameters")
-
-        failure_breakdown = stats["failure_breakdown"]
-
-        if failure_breakdown["memory_error"] > failure_breakdown["context_window"]:
-            recommendations.append("💾 Memory errors dominant - consider reducing context window or freeing RAM")
-
-        if failure_breakdown["context_window"] > 0:
-            recommendations.append("📏 Context window issues - try reducing prompt complexity or increasing n_ctx")
-
-        if failure_breakdown["model_error"] > failure_breakdown["validation_error"]:
-            recommendations.append("🔧 Model errors - check model compatibility and file integrity")
-
-        if failure_breakdown["empty_response"] > 0:
-            recommendations.append("📝 Empty responses - model may need temperature adjustment or prompt refinement")
-
-        if len(recommendations) == 0:
-            recommendations.append("✅ LLM performance looks good!")
-
-        return recommendations

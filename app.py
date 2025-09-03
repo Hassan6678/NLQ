@@ -10,7 +10,7 @@ from datetime import datetime
 import glob
 import click
 import sys
-import os, io
+import io
 
 os.environ["FLASK_RUN_NO_COLOR"] = "1"  # Just in case
 
@@ -46,27 +46,6 @@ def setup_logging():
     )
     
     return logging.getLogger(__name__)
-
-def cleanup_old_logs(logs_dir: Path, max_files: int = 12):
-    """Delete old log files if the number exceeds the limit."""
-    try:
-        # Get all log files sorted by modification time (oldest first)
-        log_files = sorted(
-            logs_dir.glob('app_*.log'),
-            key=lambda x: x.stat().st_mtime
-        )
-        
-        # Remove old files if we exceed the limit
-        if len(log_files) > max_files:
-            files_to_remove = log_files[:-max_files]
-            for file_path in files_to_remove:
-                try:
-                    file_path.unlink()
-                    print(f"Removed old log file: {file_path}")
-                except Exception as e:
-                    print(f"Failed to remove old log file {file_path}: {e}")
-    except Exception as e:
-        print(f"Error during log cleanup: {e}")
 
 # Setup logging
 logger = setup_logging()

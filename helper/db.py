@@ -19,8 +19,6 @@ class DatabaseManager:
 	"""Optimized database manager with connection pooling and chunked processing."""
 
 	def __init__(self):
-		self.active_connections: Dict[int, duckdb.DuckDBPyConnection] = {}
-		self.active_lock = threading.Lock()
 		self.table_schemas: Dict[str, Dict[str, Any]] = {}
 		self.local = threading.local()
 		self._initialize_database()
@@ -311,129 +309,47 @@ class DatabaseManager:
 			return False
 
 	def _coerce_chunk_dtypes(self, chunk: pd.DataFrame) -> pd.DataFrame:
-		"""Coerce data types with improved error handling and logging."""
+		"""Coerce basic data types."""
 		try:
 			coerced = chunk.copy()
-			conversion_summary = {"successful": 0, "failed": 0, "warnings": []}
-
-			boolean_candidates = {"productivity", "stockout", "assortment"}
 
 			for col in coerced.columns:
 				try:
 					series = coerced[col]
-					original_dtype = series.dtype
 
+					# Convert month/year columns to integers
 					if col.lower() in {"month", "year"}:
-						try:
-							coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
-							conversion_summary["successful"] += 1
-
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed to convert {col} to Int64: {e}")
-							conversion_summary["failed"] += 1
+						coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
 						continue
 
-					if col.lower() in boolean_candidates:
-						try:
-							str_vals = series.astype(str).str.strip().str.lower()
-							true_set = {"true","1","yes","y","t"}
-							false_set = {"false","0","no","n","f"}
-							mapped = str_vals.map(lambda v: 1 if v in true_set else (0 if v in false_set else pd.NA))
-							if mapped.notna().mean() > 0.9:
-								coerced[col] = mapped.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-							numeric = pd.to_numeric(series, errors="coerce")
-							if numeric.notna().mean() > 0.9 and set(numeric.dropna().unique()).issubset({0,1}):
-								coerced[col] = numeric.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-							if pd.api.types.is_bool_dtype(series):
-								coerced[col] = series.astype("Int64")
-								conversion_summary["successful"] += 1
-								continue
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed boolean conversion for {col}: {e}")
-							conversion_summary["failed"] += 1
+					# Convert boolean-like columns to integers
+					if col.lower() in {"productivity", "stockout", "assortment"}:
+						numeric = pd.to_numeric(series, errors="coerce")
+						if numeric.notna().mean() > 0.8 and set(numeric.dropna().unique()).issubset({0,1}):
+							coerced[col] = numeric.astype("Int64")
 
-					if pd.api.types.is_bool_dtype(series):
-						continue
-					if pd.api.types.is_numeric_dtype(series):
-						continue
-
-					if pd.api.types.is_object_dtype(series):
-						try:
-							cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
-							numeric = pd.to_numeric(cleaned, errors="coerce")
-							non_null_ratio = numeric.notna().mean()
-							if non_null_ratio > 0.9:
-								if (numeric.dropna() % 1 == 0).all():
-									coerced[col] = numeric.astype("Int64")
-									conversion_summary["successful"] += 1
-								else:
-									coerced[col] = numeric.astype("float64")
-									conversion_summary["successful"] += 1
-						except Exception as e:
-							conversion_summary["warnings"].append(f"Failed numeric conversion for {col}: {e}")
-							conversion_summary["failed"] += 1
-
-				except Exception as e:
-					conversion_summary["warnings"].append(f"Unexpected error processing column {col}: {e}")
-					conversion_summary["failed"] += 1			
+				except Exception:
+					pass  # Skip problematic columns
 
 			return coerced
 
-		except Exception as e:
-			logger.error(f"Critical error in data type coercion: {e}")
-			logger.warning("Falling back to original chunk without type coercion")
+		except Exception:
 			return chunk
 
 	def execute_query(self, sql: str) -> QueryResult:
 		start_time = time.time()
-		thread_id = threading.get_ident()
 		with self.get_connection() as conn:
-			try:
-				with self.active_lock:
-					self.active_connections[thread_id] = conn
-				result_df = conn.execute(sql).fetchdf()
-				execution_time = time.time() - start_time
-				memory_usage = memory_monitor.get_memory_usage()
-				return QueryResult(
-					data=result_df,
-					sql_query=sql,
-					execution_time=execution_time,
-					row_count=len(result_df),
-					memory_usage_mb=memory_usage,
-				)
-			except Exception as e:
-				logger.error(f"SQL execution error: {e}")
-				logger.error(f"SQL: {sql}")
-				raise
-			finally:
-				with self.active_lock:
-					self.active_connections.pop(thread_id, None)
+			result_df = conn.execute(sql).fetchdf()
+			execution_time = time.time() - start_time
+			memory_usage = memory_monitor.get_memory_usage()
+			return QueryResult(
+				data=result_df,
+				sql_query=sql,
+				execution_time=execution_time,
+				row_count=len(result_df),
+				memory_usage_mb=memory_usage,
+			)
 
-	def cancel_query_for_thread(self, thread_id: Optional[int] = None) -> bool:
-		try:
-			tid = thread_id if thread_id is not None else threading.get_ident()
-			with self.active_lock:
-				conn = self.active_connections.get(tid)
-			if conn is None:
-				return False
-			if hasattr(conn, "interrupt"):
-				try:
-					conn.interrupt()
-					return True
-				except Exception as e:
-					logger.warning(f"interrupt() failed: {e}")
-			try:
-				conn.close()
-				return True
-			except Exception as e:
-				logger.warning(f"close() failed during cancel: {e}")
-				return False
-		except Exception as e:
-			logger.warning(f"cancel_query_for_thread failed: {e}")
-			return False
+
 
 

@@ -1,62 +1,75 @@
-# 50 Test Questions for NLQ Chatbot System
 # These questions test various capabilities of the sales data analysis system
 
 ## Basic Sales Queries (1-10)
 1. What are the total sales for this month?
-2. Show me sales by region
-3. Which city has the highest sales?
-4. What are the top 5 performing regions?
-5. Show me sales for the last quarter
-6. What was the total sales in 2024?
-7. Which distributor has the lowest sales?
-8. Show me sales by brand
-9. What are the sales for Karachi this month?
-10. Show me the total sales for Central-A region
+2. Show me sales data grouped by region
+3. Which city has the highest total sales?
+4. What are the top 5 performing regions by sales?
+5. Show me sales figures for the last quarter
+6. What was the total sales amount in 2024?
+7. Which distributor has the lowest sales performance?
+8. Show me sales data grouped by brand
+9. What are the total sales for Karachi this month?
+10. Show me the total sales amount for Central-A region
 
 ## Time-Based Analysis (11-20)
-11. Compare sales between Q1 and Q2 this year
-12. Show me monthly sales trend for 2024
-13. What were the sales in September 2024?
-14. Show me year-over-year growth for each region
-15. Which month had the highest sales this year?
-16. Show me sales for the last 6 months
-17. Compare sales between August and September
-18. What was the sales growth from last month?
-19. Show me quarterly sales for 2024
-20. Which quarter performed best this year?
+11. Compare sales figures between Q1 and Q2 this year
+12. Show me the monthly sales trend for 2024
+13. What were the total sales in September 2024?
+14. Show me year-over-year growth analysis for each region
+15. Which month had the highest sales figures this year?
+16. Show me sales data for the last 6 months
+17. Compare sales performance between August and September
+18. What was the sales growth rate from last month?
+19. Show me quarterly sales breakdown for 2024
+20. Which quarter performed best in terms of sales this year?
 
 ## Performance Metrics (21-30)
 21. Which cities have the highest productivity percentage?
-22. Show me stockout analysis by region
+22. Show me stockout analysis grouped by region
 23. What percentage of shops are productive in Lahore?
 24. Which brands have the highest stockout rates?
-25. Show me assortment analysis for distributors
-26. Which territories have the lowest productivity?
-27. Show me stockout percentages by city
+25. Show me assortment analysis for all distributors
+26. Which territories have the lowest productivity rates?
+27. Show me stockout percentages grouped by city
 28. What are the top 5 most productive areas?
 29. Which routes have the highest assortment issues?
-30. Show me productivity comparison between regions
+30. Show me productivity comparison between different regions
 
 ## Growth and Comparison Analysis (31-40)
-31. Show me month-over-month sales growth
+31. Show me month-over-month sales growth analysis
 32. Which brands grew the most this quarter?
 33. Compare sales performance between North and South regions
 34. Show me the biggest sales increases from last month
-35. Which cities improved their productivity most?
+35. Which cities improved their productivity the most?
 36. Compare stockout rates between Q3 and Q4
-37. Show me growth by territory for the last 3 months
-38. Which distributors have the best sales growth?
-39. Compare productivity changes between months
-40. Show me the regions with declining sales
+37. Show me growth analysis by territory for the last 3 months
+38. Which distributors have the best sales growth rates?
+39. Compare productivity changes between different months
+40. Show me the regions with declining sales trends
 
 ## Advanced Analytics (41-50)
 41. What are the top 3 brands by sales in Karachi for Q4?
-42. Show me missed targets by region for September
-43. Which routes in Lahore have the lowest productivity?
-44. Show me sales vs targets by territory for this quarter
+42. Show me missed targets analysis by region for September
+43. Which routes in Lahore have the lowest productivity rates?
+44. Show me sales vs targets comparison by territory for this quarter
 45. What percentage of customers are productive in each city?
-46. Show me the best performing distributors in Central-A
+46. Show me the best performing distributors in Central-A region
 47. Which areas have both high sales and high productivity?
-48. Show me stockout analysis for top 5 brands
-49. Compare sales growth between different territories
+48. Show me stockout analysis for the top 5 brands
+49. Compare sales growth rates between different territories
 50. Show me comprehensive analysis: sales, productivity, and stockout by region for the latest month
+
+## Advanced Stockout and Target Analysis (51-62)
+51. Show me the top 5 brands with the highest stockouts in North-A region for August 2025
+52. Which brand had the highest target missed in region 'South-A' for the month of August 2025?
+53. Which route had the highest target missed in South-A region for the month of August 2025?
+54. List the top 5 territories that missed their sales targets in January 2025
+55. Which route had the highest MRO in the 'Central-A' region for February 2025?
+56. Which region has the most potential to grow in March 2025?
+57. Which region has the most growth potential in March 2025?
+58. What is the total MRO amount in region "North-A" for March 2025?
+59. Show me the top 3 cities with the highest stockout percentage in January 2025
+60. Show me the top 5 cities with the lowest productivity rates in August 2025
+61. What is the productivity percentage of route "D0485OB111" in January 2025?
+62. Which route had the highest target missed in South-A region for the month of May 2025?

@@ -55,21 +55,7 @@ class LLMManager:
         self._model_config = self._build_model_config()
         self._load_model()
 
-        # Track LLM performance and failures
-        self.failure_stats = {
-            "total_attempts": 0,
-            "successful_generations": 0,
-            "failures": {
-                "memory_error": 0,
-                "context_window": 0,
-                "model_error": 0,
-                "empty_response": 0,
-                "validation_error": 0,
-                "other": 0
-            },
-            "last_failure_reason": None,
-            "last_failure_time": None
-        }
+
 
     def _build_model_config(self) -> ModelConfig:
         """Build model configuration from config with validation."""
@@ -421,9 +407,6 @@ class LLMManager:
             logger.error("❌ LLM generation failed: Invalid prompt provided")
             raise ValueError("Invalid prompt provided")
 
-        # Track attempt
-        self.failure_stats["total_attempts"] += 1
-
         try:
             # Calculate dynamic max tokens based on prompt length and context window
             prompt_tokens = len(prompt) // 4 if prompt else 0
@@ -431,8 +414,6 @@ class LLMManager:
             dynamic_max_tokens = min(self._model_config.max_tokens, max(512, remaining_tokens))
 
             if remaining_tokens < 256:  # Not enough space for meaningful SQL
-                error_msg = f"Insufficient context space for SQL generation (remaining: {remaining_tokens} tokens)"
-                self._record_failure("context_window", error_msg)
                 return None
 
             output = self.llm(
@@ -458,7 +439,6 @@ class LLMManager:
 
             # Check if we got a meaningful response
             if not raw_text or len(raw_text.strip()) == 0:
-                self._record_failure("empty_response", "Model returned empty response")
                 return None
 
             # Check for common failure patterns
@@ -474,53 +454,37 @@ class LLMManager:
                     raw_text = f"SELECT {raw_text}"
 
             result = self._extract_and_validate_sql(raw_text)
-            if result:
-                self.failure_stats["successful_generations"] += 1
-            else:
+            if not result:
                 # Try to fix incomplete SQL with a focused retry
                 fixed_result = self._try_fix_incomplete_sql(raw_text)
                 if fixed_result:
                     result = fixed_result
-                    self.failure_stats["successful_generations"] += 1
                 else:
-                    self._record_failure("validation_error", "SQL extraction/validation failed")
                     logger.error("Failed to extract valid SQL from LLM response")
 
             return result
 
         except MemoryError as e:
-            self._record_failure("memory_error", f"Memory error: {e}")
-            logger.error("💡 Try reducing model context window or freeing up RAM")
+            logger.error(f"Memory error: {e}")
             return None
 
         except OSError as e:
             if "context" in str(e).lower() or "token" in str(e).lower():
-                self._record_failure("context_window", f"Context window exceeded: {e}")
-                logger.error(f"💡 Current context window: {self._model_config.n_ctx} tokens")
+                logger.error(f"Context window exceeded: {e}")
                 return None
             else:
-                self._record_failure("model_error", f"OS/Model loading error: {e}")
+                logger.error(f"OS/Model loading error: {e}")
                 return None
 
         except KeyError as e:
-            self._record_failure("model_error", f"Unexpected response format: {e}")
-            logger.error("💡 Model response missing expected keys (likely model compatibility issue)")
+            logger.error(f"Unexpected response format: {e}")
             return None
 
         except Exception as e:
-            error_type = type(e).__name__
-            error_msg = f"{error_type}: {e}"
-            self._record_failure("other", error_msg)
-
-            # Provide helpful troubleshooting based on error type
-            if "cuda" in str(e).lower():
-                logger.error("💡 CUDA/GPU error - try setting n_gpu_layers=0 for CPU-only mode")
-            elif "memory" in str(e).lower():
-                logger.error("💡 Memory error - try reducing n_ctx or increasing system RAM")
-            elif "timeout" in str(e).lower():
-                logger.error("💡 Timeout error - model inference took too long")
-
+            logger.error(f"LLM generation error: {e}")
             return None
+
+
 
     def _extract_and_validate_sql(self, text: str) -> Optional[str]:
         """
@@ -897,34 +861,6 @@ class LLMManager:
             logger.warning(f"🔧 SQL repair failed: {e}")
             return None
 
-    def _record_failure(self, failure_type: str, reason: str):
-        """Record a failure for statistics and logging."""
-        import time
-        self.failure_stats["failures"][failure_type] += 1
-        self.failure_stats["last_failure_reason"] = f"{failure_type}: {reason}"
-        self.failure_stats["last_failure_time"] = time.time()
-
-        logger.error(f"❌ Recorded {failure_type} failure: {reason}")
-
-    def get_failure_stats(self) -> Dict[str, Any]:
-        """Get comprehensive failure statistics."""
-        total_failures = sum(self.failure_stats["failures"].values())
-        success_rate = 0.0
-        if self.failure_stats["total_attempts"] > 0:
-            success_rate = (self.failure_stats["successful_generations"] / self.failure_stats["total_attempts"]) * 100
-
-        return {
-            "total_attempts": self.failure_stats["total_attempts"],
-            "successful_generations": self.failure_stats["successful_generations"],
-            "total_failures": total_failures,
-            "success_rate_percent": round(success_rate, 2),
-            "failure_breakdown": self.failure_stats["failures"],
-            "last_failure": {
-                "reason": self.failure_stats["last_failure_reason"],
-                "timestamp": self.failure_stats["last_failure_time"]
-            }
-        }
-
     def is_ready(self) -> bool:
         """Check if the LLM manager is ready for use."""
         return self.model_loaded and self.llm is not None
@@ -938,6 +874,5 @@ class LLMManager:
             "model_path": self._model_config.model_path,
             "summarizer_path": self._model_config.summarizer_model_path,
             "context_window": self._model_config.n_ctx,
-            "threads": self._model_config.n_threads,
-            "failure_stats": self.get_failure_stats()
+            "threads": self._model_config.n_threads
         }

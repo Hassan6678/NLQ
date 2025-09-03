@@ -18,13 +18,6 @@ class PerformanceMetrics:
 	query_count: int = 0
 	total_execution_time: float = 0.0
 	errors: int = 0
-	cache_hits: int = 0
-	cache_misses: int = 0
 	memory_peak_mb: float = 0.0
-	total_execution_time: float = 0.0
-	cache_hits: int = 0
-	cache_misses: int = 0
-	memory_peak_mb: float = 0.0
-	errors: int = 0
 
 
