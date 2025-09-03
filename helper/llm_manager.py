@@ -55,6 +55,22 @@ class LLMManager:
         self._model_config = self._build_model_config()
         self._load_model()
 
+        # Track LLM performance and failures
+        self.failure_stats = {
+            "total_attempts": 0,
+            "successful_generations": 0,
+            "failures": {
+                "memory_error": 0,
+                "context_window": 0,
+                "model_error": 0,
+                "empty_response": 0,
+                "validation_error": 0,
+                "other": 0
+            },
+            "last_failure_reason": None,
+            "last_failure_time": None
+        }
+
     def _build_model_config(self) -> ModelConfig:
         """Build model configuration from config with validation."""
         return ModelConfig(
@@ -156,201 +172,218 @@ class LLMManager:
         sample_context = self._build_sample_context(sample_data)
         stats_context = self._build_statistics_context(table_info, row_count)
 
+        # Calculate available tokens for SQL generation
+        prompt_base_length = len(f"""### You are an expert SQL generator for DuckDB.
+        ### Task: Generate a single, correct DuckDB SQL query that answers the user's question.
+        ### Given the following table schema and context:
+
+        # Table: {table_name}
+        # Schema: {schema}
+        # Total rows: {row_count:,}
+        {sample_context}
+        {stats_context}""")
+
+        # Reserve at least 1024 tokens for SQL generation
+        available_tokens = max(512, self._model_config.n_ctx - (prompt_base_length // 4) - 256)
+
         prompt = f"""### You are an expert SQL generator for DuckDB.
-### Given the following table schema and context:
+        ### Task: Generate a single, COMPLETE DuckDB SQL query that answers the user's question.
+        ### IMPORTANT: Your response MUST start with 'SELECT' and be a valid, executable SQL statement.
+        ### Given the following table schema and context:
 
-# Table: {table_name}
-# Schema: {schema}
-# Total rows: {row_count:,}
-{sample_context}
-{stats_context}
+        # Table: {table_name}
+        # Schema: {schema}
+        # Total rows: {row_count:,}
+        {sample_context}
+        {stats_context}
 
-### CRITICAL DUCKDB CONSTRAINTS:
-- Use ONLY DuckDB-compatible SQL syntax
-- NEVER use window functions like LAG(), LEAD(), ROW_NUMBER(), RANK(), DENSE_RANK()
-- NEVER use OVER() clauses with PARTITION BY or ORDER BY
-- For growth/trend analysis, use CASE statements with month comparisons instead
-- Use CTEs (WITH clauses) for complex calculations when needed
+        ### CRITICAL DUCKDB CONSTRAINTS:
+        - Use ONLY DuckDB-compatible SQL syntax
+        - NEVER use window functions like LAG(), LEAD(), ROW_NUMBER(), RANK(), DENSE_RANK()
+        - NEVER use OVER() clauses with PARTITION BY or ORDER BY
+        - For growth/trend analysis, use CASE statements with month comparisons instead
+        - Use CTEs (WITH clauses) for complex calculations when needed
 
-### IMPORTANT RULE TO AVOID HALLUCINATIONS FROM EXAMPLES/SAMPLES:
-- Do NOT use values appearing in the sample data/context as implicit filters. Never invent filters (region/city/brand/etc.) based on sample rows unless the NLQ explicitly requests them.
+        ### IMPORTANT RULE TO AVOID HALLUCINATIONS FROM EXAMPLES/SAMPLES:
+        - Do NOT use values appearing in the sample data/context as implicit filters. Never invent filters (region/city/brand/etc.) based on sample rows unless the NLQ explicitly requests them.
 
-### Important guidelines:
-- Use DuckDB SQL syntax
-- The ONLY available table is named "{table_name}". You must use exactly this table name in all FROM and JOIN clauses. Do not invent any other table names.
-- For large datasets, consider using LIMIT for exploratory queries
-- Use appropriate aggregations for summary queries
-- Handle NULL values appropriately
-- Use proper date/time functions if applicable
-- Columns may include names with spaces (e.g., "primary sales"). When referencing such columns, use double quotes, e.g., "primary sales".
-- Months and years are integers. If the question mentions a quarter (Q1..Q4), map to months: Q1={{1,2,3}}, Q2={{4,5,6}}, Q3={{7,8,9}}, Q4={{10,11,12}}.
-- Boolean flags (e.g., productivity, stockout, assortment) are stored as 0/1 integers. Use predicates like column = 1 or column = 0. Avoid TRUE/FALSE.
-- Do NOT use window functions (e.g., LAG/LEAD) in the WHERE clause. If you need to filter on a window, use QUALIFY or compute in a subquery/CTE and filter in the outer query.
-- Never use placeholder years like 20XX/XXXX or partial years (e.g., 20). Use actual 4-digit years present in the table. If the year isn't specified, prefer the latest available year for the requested month(s).
-- Do NOT add region/city/area/territory/distributor/route filters unless explicitly mentioned in the user's question.
-- **CRITICAL**: For region queries, distinguish between:
-  - **General region queries** (e.g., "top 5 regions", "all regions", "highest sales by region"): Do NOT add any region filters, just GROUP BY region
-  - **Specific region queries** (e.g., "sales in Central-A", "performance in North region"): Add the exact region filter using `LOWER(region) = 'region-name'`
-- If the user asks a general question about totals or rankings (e.g., "highest sales", "top performance") without specifying a dimension, provide a high-level summary by `region`. Do not add other filters unless specified.
-- For city-specific questions, use a simple `WHERE LOWER(city) = '...'` filter. Do not use complex joins if the information is in the same table. Only add this if the user clearly mentions a specific city name in the question — the user may name a city without the word "city" (e.g., "lahore"). If the NLQ contains a city token present in the dataset, include the city filter; otherwise do not invent one.
-- For all string comparisons in `WHERE` clauses, use the `LOWER()` function for case-insensitive matching (e.g., `LOWER(city) = 'karachi'`).
-- When the NLQ explicitly mentions a location (region/city/area/territory/distributor/route), exclude rows where `route = 'UNK'` from sales summaries by adding `route <> 'UNK'` to the WHERE clause.
-- If no location is mentioned in the NLQ, do not automatically add `route <> 'UNK'` or any location filters; return totals over the full dataset (subject to time defaults).
+        ### Important guidelines:
+        - Use DuckDB SQL syntax
+        - The ONLY available table is named "{table_name}". You must use exactly this table name in all FROM and JOIN clauses. Do not invent any other table names.
+        - For large datasets, consider using LIMIT for exploratory queries
+        - Use appropriate aggregations for summary queries
+        - Handle NULL values appropriately
+        - Use proper date/time functions if applicable
+        - Columns may include names with spaces (e.g., "primary sales"). When referencing such columns, use double quotes, e.g., "primary sales".
+        - Months and years are integers. If the question mentions a quarter (Q1..Q4), map to months: Q1={{1,2,3}}, Q2={{4,5,6}}, Q3={{7,8,9}}, Q4={{10,11,12}}.
+        - Boolean flags (e.g., productivity, stockout, assortment) are stored as 0/1 integers. Use predicates like column = 1 or column = 0. Avoid TRUE/FALSE.
+        - Do NOT use window functions (e.g., LAG/LEAD) in the WHERE clause. If you need to filter on a window, use QUALIFY or compute in a subquery/CTE and filter in the outer query.
+        - Never use placeholder years like 20XX/XXXX or partial years (e.g., 20). Use actual 4-digit years present in the table. If the year isn't specified, prefer the latest available year for the requested month(s).
+        - Do NOT add region/city/area/territory/distributor/route filters unless explicitly mentioned in the user's question.
+        - **CRITICAL**: For region queries, distinguish between:
+        - **General region queries** (e.g., "top 5 regions", "all regions", "highest sales by region"): Do NOT add any region filters, just GROUP BY region
+        - **Specific region queries** (e.g., "sales in Central-A", "performance in North region"): Add the exact region filter using `LOWER(region) = 'region-name'`
+        - If the user asks a general question about totals or rankings (e.g., "highest sales", "top performance") without specifying a dimension, provide a high-level summary by `region`. Do not add other filters unless specified.
+        - For city-specific questions, use a simple `WHERE LOWER(city) = '...'` filter. Do not use complex joins if the information is in the same table. Only add this if the user clearly mentions a specific city name in the question — the user may name a city without the word "city" (e.g., "lahore"). If the NLQ contains a city token present in the dataset, include the city filter; otherwise do not invent one.
+        - For all string comparisons in `WHERE` clauses, use the `LOWER()` function for case-insensitive matching (e.g., `LOWER(city) = 'karachi'`).
+        - When the NLQ explicitly mentions a location (region/city/area/territory/distributor/route), exclude rows where `route = 'UNK'` from sales summaries by adding `route <> 'UNK'` to the WHERE clause.
+        - If no location is mentioned in the NLQ, do not automatically add `route <> 'UNK'` or any location filters; return totals over the full dataset (subject to time defaults).
 
-### Dataset information
-- The ONLY table to use is "{table_name}" (use this exact name).
-- Data is monthly with integer columns: month (1..12), year (e.g., 2024).
-- Columns include: region, city, area, territory, distributor, route, customer, sku, brand, variant, packtype, sales, "primary sales", target, mto, productivity, mro, stockout, assortment, and specialized mro components.
-- If the user specifies explicit months and/or year in the question, USE THOSE EXACT PERIODS in the SQL. Do NOT change or infer different months/years.
-- If the question omits months/years, prefer the latest available period(s).
-- **Do NOT invent or add any dimension filters (region/city/area/territory/distributor/route/brand/sku/customer) that are not explicitly present in the user's question.** Only include such filters when the NLQ contains clear, explicit mentions.
-- Region to city mapping: Central-A is lahore, South-C is hyderabad, Central-B is faisalabad, Central-D is gujranwala, Central-C is multan, North-B is peshawar, North-A is rawalpindi, South-B is sukkur, South-A is karachi.
+        ### Dataset information
+        - The ONLY table to use is "{table_name}" (use this exact name).
+        - Data is monthly with integer columns: month (1..12), year (e.g., 2024).
+        - Columns include: region, city, area, territory, distributor, route, customer, sku, brand, variant, packtype, sales, "primary sales", target, mto, productivity, mro, stockout, assortment, and specialized mro components.
+        - If the user specifies explicit months and/or year in the question, USE THOSE EXACT PERIODS in the SQL. Do NOT change or infer different months/years.
+        - If the question omits months/years, prefer the latest available period(s).
+        - **Do NOT invent or add any dimension filters (region/city/area/territory/distributor/route/brand/sku/customer) that are not explicitly present in the user's question.** Only include such filters when the NLQ contains clear, explicit mentions.
+        - Region to city mapping: Central-A is lahore, South-C is hyderabad, Central-B is faisalabad, Central-D is gujranwala, Central-C is multan, North-B is peshawar, North-A is rawalpindi, South-B is sukkur, South-A is karachi.
 
-### Supported query types
-- Sales/revenue totals and rankings by any dimension.
-- Growth analysis (latest vs previous month; or user-specified periods/quarters).
-- Targets and gaps: use mto for "missed target"/"target gap" (do not compute target - sales or target - mro). Use SUM() when ranking totals of sales/mro/mto across groups (avoid MAX for these totals).
-- **CRITICAL: For percentage queries involving customer-level metrics (productivity, assortment, stockout), ALWAYS use COUNT(DISTINCT customer) to count unique shops/customers:**
-  - Productivity percentage: Use COUNT(DISTINCT customer) for both productive and unproductive shops
-  - Assortment percentage: Use COUNT(DISTINCT customer) for both assorted and unassorted shops
-  - Stockout percentage: Use COUNT(DISTINCT customer) for both stockout and non-stockout shops
-  - **NEVER use COUNT(*) for these percentage calculations** - always use COUNT(DISTINCT customer)
-- For other metrics (sales, mro, mto, etc.), use COUNT(*) or SUM() as appropriate.
-- Stockout analysis: For "highest stockouts" by a dimension (e.g., brands) in a period and region,
-  compute both count and percentage using COUNT(DISTINCT customer) for unique shops, e.g.:
-  SELECT brand,
-         COUNT(DISTINCT CASE WHEN stockout = 1 THEN customer END) AS stockout_shops,
-         COUNT(DISTINCT CASE WHEN stockout = 0 THEN customer END) AS not_stockout_shops,
-         COUNT(DISTINCT customer) AS total_shops,
-         (COUNT(DISTINCT CASE WHEN stockout = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS stockout_percentage,
-         (COUNT(DISTINCT CASE WHEN stockout = 0 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS not_stockout_percentage
-  FROM {table_name}
-  WHERE LOWER(region) = 'north-a' AND month = 7 AND year = 2025
-  GROUP BY brand
-  ORDER BY stockout_percentage DESC, stockout_shops DESC
-  LIMIT 5;
-- Time filters: specific months, years, or quarters (Q1..Q4).
+        ### Supported query types
+        - Sales/revenue totals and rankings by any dimension.
+        - Growth analysis (latest vs previous month; or user-specified periods/quarters).
+        - Targets and gaps: use mto for "missed target"/"target gap" (do not compute target - sales or target - mro). Use SUM() when ranking totals of sales/mro/mto across groups (avoid MAX for these totals).
+        - **CRITICAL: For percentage queries involving customer-level metrics (productivity, assortment, stockout), ALWAYS use COUNT(DISTINCT customer) to count unique shops/customers:**
+        - Productivity percentage: Use COUNT(DISTINCT customer) for both productive and unproductive shops
+        - Assortment percentage: Use COUNT(DISTINCT customer) for both assorted and unassorted shops
+        - Stockout percentage: Use COUNT(DISTINCT customer) for both stockout and non-stockout shops
+        - **NEVER use COUNT(*) for these percentage calculations** - always use COUNT(DISTINCT customer)
+        - For other metrics (sales, mro, mto, etc.), use COUNT(*) or SUM() as appropriate.
+        - Stockout analysis: For "highest stockouts" by a dimension (e.g., brands) in a period and region,
+        compute both count and percentage using COUNT(DISTINCT customer) for unique shops, e.g.:
+        SELECT brand,
+                COUNT(DISTINCT CASE WHEN stockout = 1 THEN customer END) AS stockout_shops,
+                COUNT(DISTINCT CASE WHEN stockout = 0 THEN customer END) AS not_stockout_shops,
+                COUNT(DISTINCT customer) AS total_shops,
+                (COUNT(DISTINCT CASE WHEN stockout = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS stockout_percentage,
+                (COUNT(DISTINCT CASE WHEN stockout = 0 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS not_stockout_percentage
+        FROM {table_name}
+        WHERE LOWER(region) = 'north-a' AND month = 7 AND year = 2025
+        GROUP BY brand
+        ORDER BY stockout_percentage DESC, stockout_shops DESC
+        LIMIT 5;
+        - Time filters: specific months, years, or quarters (Q1..Q4).
 
-### Example patterns (adjust filters and dimensions):
-1) Highest sales route in Karachi for a specific year:
-SELECT route, SUM(sales) AS total_sales
-FROM {table_name}
-WHERE LOWER(city) = 'karachi' AND year = 2025 AND route <> 'UNK'
-GROUP BY route
-ORDER BY total_sales DESC
-LIMIT 1;
+        ### Example patterns (adjust filters and dimensions):
+        1) Highest sales route in Karachi for a specific year:
+        SELECT route, SUM(sales) AS total_sales
+        FROM {table_name}
+        WHERE LOWER(city) = 'karachi' AND year = 2025 AND route <> 'UNK'
+        GROUP BY route
+        ORDER BY total_sales DESC
+        LIMIT 1;
 
-2) Worst productivity percentage by distributor in a city for a month:
-SELECT region, city, area, territory, distributor,
- COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
- COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) AS unproductive_shops,
- COUNT(DISTINCT customer) AS total_shops,
- (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS productivity_percentage,
- (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS unproductivity_percentage
-FROM {table_name}
-WHERE LOWER(city) = 'lahore' AND route <> 'UNK'
-GROUP BY region, city, area, territory, distributor
-ORDER BY unproductivity_percentage DESC
-LIMIT 1;
+        2) Worst productivity percentage by distributor in a city for a month:
+        SELECT region, city, area, territory, distributor,
+        COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
+        COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) AS unproductive_shops,
+        COUNT(DISTINCT customer) AS total_shops,
+        (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS productivity_percentage,
+        (COUNT(DISTINCT CASE WHEN month = 9 AND year = 2024 AND productivity = 0 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS unproductivity_percentage
+        FROM {table_name}
+        WHERE LOWER(city) = 'lahore' AND route <> 'UNK'
+        GROUP BY region, city, area, territory, distributor
+        ORDER BY unproductivity_percentage DESC
+        LIMIT 1;
 
-3) Routes with highest stockout percentage in a region for a month:
-SELECT region, city, area, territory, distributor, route,
- COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
- COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 0 THEN customer END) AS not_stockout_shops,
- COUNT(DISTINCT customer) AS total_shops,
- (COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS stockout_percentage
-FROM {table_name}
-WHERE LOWER(region) = 'north b' AND route <> 'UNK'
-GROUP BY region, city, area, territory, distributor, route
-ORDER BY stockout_percentage DESC
-LIMIT 1;
+        3) Routes with highest stockout percentage in a region for a month:
+        SELECT region, city, area, territory, distributor, route,
+        COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
+        COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 0 THEN customer END) AS not_stockout_shops,
+        COUNT(DISTINCT customer) AS total_shops,
+        (COUNT(DISTINCT CASE WHEN month = 12 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / COUNT(DISTINCT customer)) AS stockout_percentage
+        FROM {table_name}
+        WHERE LOWER(region) = 'north b' AND route <> 'UNK'
+        GROUP BY region, city, area, territory, distributor, route
+        ORDER BY stockout_percentage DESC
+        LIMIT 1;
 
-4) City growth (use user-specified periods as-is; otherwise use latest vs previous):
-SELECT region, city,
- SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) AS sales_current_month,
- SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END) AS sales_previous_month,
- ((SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) -
-   SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END)) /
-  NULLIF(SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END), 0)) * 100 AS sales_growth_percentage
-FROM {table_name}
-WHERE LOWER(city) = 'lahore' AND route <> 'UNK'
-GROUP BY region, city
-ORDER BY sales_growth_percentage DESC
-LIMIT 1;
+        4) City growth (use user-specified periods as-is; otherwise use latest vs previous):
+        SELECT region, city,
+        SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) AS sales_current_month,
+        SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END) AS sales_previous_month,
+        ((SUM(CASE WHEN month = <latest_month> THEN sales ELSE 0 END) -
+        SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END)) /
+        NULLIF(SUM(CASE WHEN month = <previous_month> THEN sales ELSE 0 END), 0)) * 100 AS sales_growth_percentage
+        FROM {table_name}
+        WHERE LOWER(city) = 'lahore' AND route <> 'UNK'
+        GROUP BY region, city
+        ORDER BY sales_growth_percentage DESC
+        LIMIT 1;
 
-5) Brands with highest stockout percentage in a region for a month:
-SELECT brand,
- COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
- COUNT(DISTINCT customer) AS total_shops,
- (COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS stockout_percentage
-FROM {table_name}
-WHERE LOWER(region) = 'north-a' AND route <> 'UNK'
-GROUP BY brand
-ORDER BY stockout_percentage DESC
-LIMIT 5;
+        5) Brands with highest stockout percentage in a region for a month:
+        SELECT brand,
+        COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) AS stockout_shops,
+        COUNT(DISTINCT customer) AS total_shops,
+        (COUNT(DISTINCT CASE WHEN month = 11 AND year = 2024 AND stockout = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS stockout_percentage
+        FROM {table_name}
+        WHERE LOWER(region) = 'north-a' AND route <> 'UNK'
+        GROUP BY brand
+        ORDER BY stockout_percentage DESC
+        LIMIT 5;
 
-6) Route with highest missed target (use mto) within filters:
-SELECT route, SUM(mto) AS total_mto
-FROM {table_name}
-WHERE LOWER(region) = 'south-a' AND month = 12 AND year = 2024 AND route <> 'UNK'
-GROUP BY route
-ORDER BY total_mto DESC
-LIMIT 1;
+        6) Route with highest missed target (use mto) within filters:
+        SELECT route, SUM(mto) AS total_mto
+        FROM {table_name}
+        WHERE LOWER(region) = 'south-a' AND month = 12 AND year = 2024 AND route <> 'UNK'
+        GROUP BY route
+        ORDER BY total_mto DESC
+        LIMIT 1;
 
-7) Lowest productive area in Central-A region for a month (specific region):
-SELECT area,
- COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
- COUNT(DISTINCT customer) AS total_shops,
- (COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS productivity_percentage
-FROM {table_name}
-WHERE LOWER(region) = 'central-a' AND route <> 'UNK'
-GROUP BY area
-ORDER BY productivity_percentage ASC
-LIMIT 1;
+        7) Lowest productive area in Central-A region for a month (specific region):
+        SELECT area,
+        COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) AS productive_shops,
+        COUNT(DISTINCT customer) AS total_shops,
+        (COUNT(DISTINCT CASE WHEN month = 2 AND year = 2024 AND productivity = 1 THEN customer END) * 100.0 / NULLIF(COUNT(DISTINCT customer), 0)) AS productivity_percentage
+        FROM {table_name}
+        WHERE LOWER(region) = 'central-a' AND route <> 'UNK'
+        GROUP BY area
+        ORDER BY productivity_percentage ASC
+        LIMIT 1;
 
-8) Region with most growth potential (comparing two months):
-WITH monthly_sales AS (
-   SELECT region, month, SUM(sales) AS total_sales
-   FROM {table_name}
-   WHERE year = 2024 AND route <> 'UNK'
-   GROUP BY region, month
-)
-SELECT region,
-      (SUM(CASE WHEN month = 12 THEN total_sales END) -
-       SUM(CASE WHEN month = 11 THEN total_sales END)) * 100.0 /
-       NULLIF(SUM(CASE WHEN month = 11 THEN total_sales END), 0) AS sales_growth_percentage
-FROM monthly_sales
-GROUP BY region
-ORDER BY sales_growth_percentage DESC
-LIMIT 1;
+        8) Region with most growth potential (comparing two months):
+        WITH monthly_sales AS (
+        SELECT region, month, SUM(sales) AS total_sales
+        FROM {table_name}
+        WHERE year = 2024 AND route <> 'UNK'
+        GROUP BY region, month
+        )
+        SELECT region,
+            (SUM(CASE WHEN month = 12 THEN total_sales END) -
+            SUM(CASE WHEN month = 11 THEN total_sales END)) * 100.0 /
+            NULLIF(SUM(CASE WHEN month = 11 THEN total_sales END), 0) AS sales_growth_percentage
+        FROM monthly_sales
+        GROUP BY region
+        ORDER BY sales_growth_percentage DESC
+        LIMIT 1;
 
-9) Top 5 regions by sales in a specific month (general region query - NO region filters):
-SELECT region, SUM(sales) AS total_sales
-FROM {table_name}
-WHERE month = 1 AND year = 2025 AND route <> 'UNK'
-GROUP BY region
-ORDER BY total_sales DESC
-LIMIT 5;
+        9) Top 5 regions by sales in a specific month (general region query - NO region filters):
+        SELECT region, SUM(sales) AS total_sales
+        FROM {table_name}
+        WHERE month = 1 AND year = 2025 AND route <> 'UNK'
+        GROUP BY region
+        ORDER BY total_sales DESC
+        LIMIT 5;
 
-10) Territory growth analysis (avoiding window functions):
-SELECT territory,
-      SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) AS sales_december,
-      SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) AS sales_november,
-      ((SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) -
-        SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END)) /
-       NULLIF(SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END), 0)) * 100 AS growth_percentage
-FROM {table_name}
-WHERE route <> 'UNK'
-GROUP BY territory
-HAVING SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) > 0
-ORDER BY growth_percentage DESC
-LIMIT 5;
+        10) Territory growth analysis (avoiding window functions):
+        SELECT territory,
+            SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) AS sales_december,
+            SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) AS sales_november,
+            ((SUM(CASE WHEN month = 12 AND year = 2024 THEN sales ELSE 0 END) -
+                SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END)) /
+            NULLIF(SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END), 0)) * 100 AS growth_percentage
+        FROM {table_name}
+        WHERE route <> 'UNK'
+        GROUP BY territory
+        HAVING SUM(CASE WHEN month = 11 AND year = 2024 THEN sales ELSE 0 END) > 0
+        ORDER BY growth_percentage DESC
+        LIMIT 5;
 
-### Write a SQL query to answer the question:
-# {nlq}
+        ### Write a SQL query to answer the question:
+        {nlq}
 
-### SQL:
-SELECT"""
+        ### IMPORTANT: Generate ONLY the complete SQL query. Do NOT include explanations.
+        ### SQL (DuckDB):
+        SELECT"""
 
         return prompt
 
@@ -397,18 +430,35 @@ SELECT"""
             Validated SQL string or None if generation fails
         """
         if not self.model_loaded:
+            logger.error("❌ LLM generation failed: Model not loaded")
             raise RuntimeError("Model not loaded - cannot generate SQL")
 
         if not prompt or not isinstance(prompt, str):
+            logger.error("❌ LLM generation failed: Invalid prompt provided")
             raise ValueError("Invalid prompt provided")
 
+        # Track attempt and log details
+        self.failure_stats["total_attempts"] += 1
+        prompt_length = len(prompt) if prompt else 0
+        logger.debug(f"🤖 Starting LLM SQL generation (attempt #{self.failure_stats['total_attempts']}) with prompt length: {prompt_length} chars")
+
         try:
-            logger.debug("Generating SQL from prompt")
+            # Calculate dynamic max tokens based on prompt length and context window
+            prompt_tokens = prompt_length // 4  # Rough estimate
+            remaining_tokens = self._model_config.n_ctx - prompt_tokens - 100  # Reserve 100 tokens for safety
+            dynamic_max_tokens = min(self._model_config.max_tokens, max(512, remaining_tokens))
+
+            if remaining_tokens < 256:  # Not enough space for meaningful SQL
+                error_msg = f"Insufficient context space for SQL generation (remaining: {remaining_tokens} tokens)"
+                self._record_failure("context_window", error_msg)
+                return None
+
+            logger.debug(f"📏 Using dynamic max_tokens: {dynamic_max_tokens} (remaining context: {remaining_tokens} tokens)")
 
             output = self.llm(
                 prompt,
                 temperature=self._model_config.temperature,
-                max_tokens=self._model_config.max_tokens,
+                max_tokens=dynamic_max_tokens,
                 stop=[
                     "###",
                     "\n\n",
@@ -420,16 +470,84 @@ SELECT"""
                     "```",
                     "<|assistant|>",
                     "</s>",
+                    ";",  # Allow semicolon as a natural stopping point
                 ],
             )
 
             raw_text = output["choices"][0]["text"]
-            logger.debug(f"Raw LLM output length: {len(raw_text)}")
+            logger.debug(f"✅ LLM responded with {len(raw_text)} characters")
 
-            return self._extract_and_validate_sql(raw_text)
+            # Check if we got a meaningful response
+            if not raw_text or len(raw_text.strip()) == 0:
+                self._record_failure("empty_response", "Model returned empty response")
+                return None
+
+            # Check for common failure patterns
+            if any(phrase in raw_text.lower() for phrase in ["i don't know", "i cannot", "i'm sorry", "unable to"]):
+                logger.warning(f"⚠️ LLM indicated uncertainty in response: {raw_text[:100]}...")
+                # Don't fail here, let SQL extraction handle it
+
+            # Enhanced validation: Check if response looks like it could be SQL
+            raw_text_stripped = raw_text.strip()
+            if not raw_text_stripped.upper().startswith("SELECT") and not raw_text_stripped[0].isupper():
+                logger.warning(f"⚠️ LLM response doesn't start with SELECT: '{raw_text_stripped[:100]}...'")
+                # Try to fix incomplete responses by prepending SELECT
+                if raw_text_stripped and not raw_text_stripped.upper().startswith(("SELECT", "FROM", "WHERE", "GROUP", "ORDER")):
+                    logger.info("🔧 Attempting to fix incomplete SQL by prepending SELECT")
+                    raw_text = f"SELECT {raw_text}"
+
+            result = self._extract_and_validate_sql(raw_text)
+            if result:
+                self.failure_stats["successful_generations"] += 1
+                logger.info(f"✅ LLM generation successful (success rate: {self.failure_stats['successful_generations']}/{self.failure_stats['total_attempts']})")
+                logger.debug(f"🎯 Final SQL: {result[:200]}{'...' if len(result) > 200 else ''}")
+            else:
+                # Try to fix incomplete SQL with a focused retry
+                logger.warning("⚠️ Initial SQL extraction failed, attempting repair...")
+                fixed_result = self._try_fix_incomplete_sql(raw_text)
+                if fixed_result:
+                    result = fixed_result
+                    self.failure_stats["successful_generations"] += 1
+                    logger.info("✅ SQL repair successful!")
+                    logger.debug(f"🎯 Repaired SQL: {result[:200]}{'...' if len(result) > 200 else ''}")
+                else:
+                    self._record_failure("validation_error", "SQL extraction/validation failed")
+                    logger.error(f"❌ Failed to extract valid SQL from: '{raw_text[:200]}...'")
+
+            return result
+
+        except MemoryError as e:
+            self._record_failure("memory_error", f"Memory error: {e}")
+            logger.error("💡 Try reducing model context window or freeing up RAM")
+            return None
+
+        except OSError as e:
+            if "context" in str(e).lower() or "token" in str(e).lower():
+                self._record_failure("context_window", f"Context window exceeded: {e}")
+                logger.error(f"💡 Current context window: {self._model_config.n_ctx} tokens")
+                return None
+            else:
+                self._record_failure("model_error", f"OS/Model loading error: {e}")
+                return None
+
+        except KeyError as e:
+            self._record_failure("model_error", f"Unexpected response format: {e}")
+            logger.error("💡 Model response missing expected keys (likely model compatibility issue)")
+            return None
 
         except Exception as e:
-            logger.error(f"SQL generation failed: {e}")
+            error_type = type(e).__name__
+            error_msg = f"{error_type}: {e}"
+            self._record_failure("other", error_msg)
+
+            # Provide helpful troubleshooting based on error type
+            if "cuda" in str(e).lower():
+                logger.error("💡 CUDA/GPU error - try setting n_gpu_layers=0 for CPU-only mode")
+            elif "memory" in str(e).lower():
+                logger.error("💡 Memory error - try reducing n_ctx or increasing system RAM")
+            elif "timeout" in str(e).lower():
+                logger.error("💡 Timeout error - model inference took too long")
+
             return None
 
     def _extract_and_validate_sql(self, text: str) -> Optional[str]:
@@ -444,17 +562,35 @@ SELECT"""
         """
         try:
             if not text or not isinstance(text, str):
+                logger.error("❌ SQL extraction failed: Input text is empty or not a string")
                 return None
 
             text = text.strip()
             if not text:
+                logger.error("❌ SQL extraction failed: Text is empty after stripping")
                 return None
 
-            # Ensure SELECT is present
+            logger.debug(f"🔍 Extracting SQL from LLM response (length: {len(text)} chars)")
+            logger.debug(f"📄 LLM Response preview: {text[:200]}...")
+
+            # Ensure SELECT is present - more flexible approach
             if "SELECT" not in text.upper():
-                if text.startswith(("FROM", "WHERE", "GROUP", "ORDER", "LIMIT")):
+                text_stripped = text.strip()
+                if text_stripped.startswith(("FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "JOIN")):
+                    logger.info("🔧 Adding missing SELECT keyword to LLM response")
+                    text = "SELECT " + text
+                elif "," in text_stripped and ("FROM" in text_stripped.upper() or "WHERE" in text_stripped.upper()):
+                    # Looks like column list without SELECT
+                    logger.info("🔧 Detected column list without SELECT, adding SELECT")
+                    text = "SELECT " + text
+                elif text_stripped and not text_stripped[0].isupper() and len(text_stripped.split()) > 2:
+                    # Looks like partial SQL starting with lowercase
+                    logger.info("🔧 Detected partial SQL response, attempting to complete")
                     text = "SELECT " + text
                 else:
+                    logger.error("❌ SQL extraction failed: No SELECT keyword found in response")
+                    logger.error(f"💡 Response: '{text[:100]}...'")
+                    logger.error("💡 Expected format: SQL statement starting with SELECT")
                     return None
 
             text_upper = text.upper()
@@ -463,7 +599,9 @@ SELECT"""
             if "SELECT" in text_upper:
                 sql_start = text_upper.find("SELECT")
                 sql_text = text[sql_start:]
+                logger.debug(f"✅ Found SELECT at position {sql_start}")
             else:
+                logger.error("❌ SQL extraction failed: Could not locate SELECT statement")
                 return None
 
             # Find SQL end using multiple delimiters
@@ -481,27 +619,39 @@ SELECT"""
                 "</s>",
             ]
 
+            found_delimiter = None
             for delimiter in delimiters:
                 pos = lower_sql_text.find(delimiter)
                 if pos != -1:
                     sql_end = min(sql_end, pos)
+                    found_delimiter = delimiter
+                    break
 
             sql = sql_text[:sql_end].strip()
+            logger.debug(f"📝 Extracted SQL (length: {len(sql)} chars, ended with: '{found_delimiter or 'EOF'}')")
 
             # Ensure semicolon
             if not sql.endswith(";"):
                 sql += ";"
+                logger.debug("🔧 Added missing semicolon to SQL")
+
+            # Log the extracted SQL for debugging
+            logger.debug(f"🔍 Extracted SQL: {sql}")
 
             # Validate SQL
             validation = self._validate_sql_syntax(sql)
             if validation.is_valid:
-                return validation.sanitized_sql or sql
+                final_sql = validation.sanitized_sql or sql
+                logger.info(f"✅ SQL validation passed - final SQL length: {len(final_sql)} chars")
+                return final_sql
 
-            logger.warning(f"SQL validation failed: {validation.error_message}")
+            logger.error(f"❌ SQL extraction failed: Validation error - {validation.error_message}")
+            logger.error(f"💡 Invalid SQL: {sql}")
             return None
 
         except Exception as e:
-            logger.error(f"SQL extraction failed: {e}")
+            logger.error(f"❌ SQL extraction failed: Unexpected error during parsing - {e}")
+            logger.error(f"💡 Raw LLM response: {text[:500]}...")
             return None
 
     def _validate_sql_syntax(self, sql: str) -> SQLValidationResult:
@@ -744,6 +894,101 @@ SELECT"""
 
         return text
 
+    def _try_fix_incomplete_sql(self, raw_text: str) -> Optional[str]:
+        """Attempt to fix incomplete or malformed SQL responses."""
+        try:
+            text = raw_text.strip()
+            logger.debug(f"🔧 Attempting to repair SQL: '{text[:100]}...'")
+
+            # Case 1: Response starts with column names (like "city, SUM(sales)")
+            if "," in text[:50] and any(keyword in text.upper() for keyword in ["FROM", "WHERE", "GROUP", "ORDER"]):
+                logger.info("🔧 Case 1: Detected column list, constructing complete SQL")
+                # Try to extract components
+                parts = text.split()
+                from_idx = next((i for i, part in enumerate(parts) if part.upper() == "FROM"), -1)
+                if from_idx > 0:
+                    columns = " ".join(parts[:from_idx])
+                    rest = " ".join(parts[from_idx:])
+                    fixed_sql = f"SELECT {columns} {rest}"
+                    if not fixed_sql.endswith(";"):
+                        fixed_sql += ";"
+                    logger.info(f"🔧 Fixed SQL: {fixed_sql}")
+                    return fixed_sql
+
+            # Case 2: Missing SELECT but has FROM clause
+            if text.upper().startswith(("FROM", "WHERE")):
+                logger.info("🔧 Case 2: Missing SELECT keyword")
+                fixed_sql = f"SELECT * {text}"
+                if not fixed_sql.endswith(";"):
+                    fixed_sql += ";"
+                return fixed_sql
+
+            # Case 3: Response looks like partial column specification
+            if text and not text[0].isupper() and len(text.split()) >= 3:
+                # Check if it looks like a column aggregation pattern
+                if any(agg in text.upper() for agg in ["SUM(", "COUNT(", "AVG(", "MAX(", "MIN("]):
+                    logger.info("🔧 Case 3: Detected aggregation pattern, adding SELECT")
+                    fixed_sql = f"SELECT {text}"
+                    if not fixed_sql.endswith(";"):
+                        fixed_sql += ";"
+                    return fixed_sql
+
+            # Case 4: Try to append missing components
+            if "FROM" in text.upper() and not text.upper().startswith("SELECT"):
+                logger.info("🔧 Case 4: Has FROM but missing SELECT")
+                # Look for table name after FROM
+                from_match = text.upper().find("FROM")
+                table_part = text[from_match:]
+                fixed_sql = f"SELECT * {table_part}"
+                if not fixed_sql.endswith(";"):
+                    fixed_sql += ";"
+                return fixed_sql
+
+            logger.warning("🔧 Could not repair SQL - unsupported pattern")
+            return None
+
+        except Exception as e:
+            logger.warning(f"🔧 SQL repair failed: {e}")
+            return None
+
+    def _record_failure(self, failure_type: str, reason: str):
+        """Record a failure for statistics and logging."""
+        import time
+        self.failure_stats["failures"][failure_type] += 1
+        self.failure_stats["last_failure_reason"] = f"{failure_type}: {reason}"
+        self.failure_stats["last_failure_time"] = time.time()
+
+        logger.error(f"❌ Recorded {failure_type} failure: {reason}")
+
+    def get_failure_stats(self) -> Dict[str, Any]:
+        """Get comprehensive failure statistics."""
+        total_failures = sum(self.failure_stats["failures"].values())
+        success_rate = 0.0
+        if self.failure_stats["total_attempts"] > 0:
+            success_rate = (self.failure_stats["successful_generations"] / self.failure_stats["total_attempts"]) * 100
+
+        return {
+            "total_attempts": self.failure_stats["total_attempts"],
+            "successful_generations": self.failure_stats["successful_generations"],
+            "total_failures": total_failures,
+            "success_rate_percent": round(success_rate, 2),
+            "failure_breakdown": self.failure_stats["failures"],
+            "last_failure": {
+                "reason": self.failure_stats["last_failure_reason"],
+                "timestamp": self.failure_stats["last_failure_time"]
+            }
+        }
+
+    def update_latest_periods(self, latest_periods: List[Tuple[int, int]]) -> None:
+        """
+        Update the latest periods information for use in prompts and context.
+
+        Args:
+            latest_periods: List of tuples containing (year, month) for latest periods
+        """
+        self.latest_periods = latest_periods
+        logger.debug(f"📅 Updated latest periods in LLM manager: {[f'{m}/{y}' for y, m in latest_periods[:3]]}")
+
     def is_ready(self) -> bool:
         """Check if the LLM manager is ready for use."""
         return self.model_loaded and self.llm is not None
@@ -756,4 +1001,7 @@ SELECT"""
             "uses_separate_summarizer": self.summarizer_llm is not self.llm,
             "model_path": self._model_config.model_path,
             "summarizer_path": self._model_config.summarizer_model_path,
+            "context_window": self._model_config.n_ctx,
+            "threads": self._model_config.n_threads,
+            "failure_stats": self.get_failure_stats()
         }

@@ -676,12 +676,24 @@ class NLQSystem:
         with memory_monitor.monitor_operation(f"Loading {file_path}"):
             result = self.db_manager.load_csv_chunked(file_path, table_name)
             self.loaded_tables[table_name] = result
+
+            # Initialize latest periods in LLM manager for default values
+            try:
+                latest_periods = self.db_manager.get_latest_periods(table_name, limit=5)
+                if latest_periods:
+                    # Only update if method exists (optional functionality)
+                    if hasattr(self.llm_manager, 'update_latest_periods'):
+                        self.llm_manager.update_latest_periods(latest_periods)
+                    logger.info(f"📅 Initialized LLM with latest periods from {table_name}: {[f'{m}/{y}' for y, m in latest_periods[:3]]}")
+            except Exception as e:
+                logger.warning(f"Could not initialize latest periods: {e}")
+
             return result
 
     # ---------------- Main Query Processing -----------------
     def query(self, nlq: str, table_name: str = "sales_data") -> QueryResult:
         """
-        Process natural language query with comprehensive pipeline.
+        Process natural language query with LLM-first pipeline and robust fallbacks.
 
         Args:
             nlq: Natural language query
@@ -699,12 +711,55 @@ class NLQSystem:
 
             # Check cache first
             cached_sql = self.cache.get_cached_sql(nlq)
+            used_llm = False
+            sql_source = "cache" if cached_sql else None
             if cached_sql:
                 sql = cached_sql
                 logger.info("Using cached SQL")
             else:
-                # Generate SQL through pipeline
-                sql = self._generate_sql_pipeline(nlq, table_name)
+                # LLM-first generation with rule-based fallback (configurable)
+                if getattr(config.system, "prefer_llm_first", True):
+                    logger.info("🤖 Attempting LLM-first SQL generation")
+                    logger.debug(f"📝 Processing query: '{nlq[:100]}{'...' if len(nlq) > 100 else ''}'")
+
+                    try:
+                        # Update latest periods in LLM manager before generating prompt
+                        latest_periods = self.db_manager.get_latest_periods(table_name, limit=3)
+                        if latest_periods:
+                            # Only update if method exists (optional functionality)
+                            if hasattr(self.llm_manager, 'update_latest_periods'):
+                                self.llm_manager.update_latest_periods(latest_periods)
+                            logger.debug(f"📅 Updated LLM with latest periods: {[f'{m}/{y}' for y, m in latest_periods[:2]]}")
+
+                        table_info = self.db_manager.get_table_info(table_name)
+                        prompt = self.llm_manager.build_enhanced_prompt(nlq, table_info)
+                        logger.debug(f"📋 Generated prompt with {len(prompt)} characters")
+
+                        sql = self.llm_manager.generate_sql(prompt)
+
+                        if sql:
+                            used_llm = True
+                            sql_source = "llm"
+                            logger.info("✅ LLM successfully generated SQL")
+                            logger.debug(f"🔍 LLM-generated SQL: {sql[:200]}{'...' if len(sql) > 200 else ''}")
+                        else:
+                            used_llm = False
+                            sql_source = "rules"
+                            logger.warning("⚠️ LLM SQL generation returned None; falling back to rule-based pipeline")
+                            logger.info("🔄 Switching to rule-based intent pipeline")
+                            sql = self._generate_sql_pipeline(nlq, table_name)
+
+                    except Exception as llm_error:
+                        used_llm = False
+                        sql_source = "rules"
+                        error_type = type(llm_error).__name__
+                        logger.error(f"❌ LLM generation failed with {error_type}: {llm_error}")
+                        logger.info("🔄 Switching to rule-based intent pipeline due to LLM error")
+                        sql = self._generate_sql_pipeline(nlq, table_name)
+                else:
+                    # Legacy pipeline (rule-based first)
+                    sql = self._generate_sql_pipeline(nlq, table_name)
+                    sql_source = "rules"
 
             # Post-processing pipeline
             sql = self._post_process_sql(sql, nlq, table_name)
@@ -717,13 +772,42 @@ class NLQSystem:
                 cached_result.data = self._sanitize_dataframe(cached_result.data)
                 return cached_result
 
-            # Execute with repair fallback
-            result = self._execute_with_repair(sql, nlq, table_name)
+            # Execute with repair; on failure optionally fallback to rule-based
+            try:
+                result = self._execute_with_repair(sql, nlq, table_name)
+            except Exception as exec_err:
+                if getattr(config.system, "fallback_on_exec_error", True) and sql_source != "rules":
+                    logger.info("Execution failed for LLM SQL; attempting rule-based fallback execution")
+                    fallback_sql = self._build_rule_based_fallback(nlq, table_name)
+                    if fallback_sql and fallback_sql.strip() and fallback_sql.strip() != sql.strip():
+                        fallback_sql = self._post_process_sql(fallback_sql, nlq, table_name)
+                        result = self._execute_with_repair(fallback_sql, nlq, table_name)
+                        sql = fallback_sql
+                        used_llm = False
+                        sql_source = "rules"
+                    else:
+                        raise
+                else:
+                    raise
 
             # Generate summary if needed
             if result.row_count > 0:
                 summary = self.llm_manager.summarize_result(nlq, result.data, sql)
                 result.summary_text = summary
+            elif getattr(config.system, "fallback_on_empty_result", True) and sql_source == "llm":
+                # Empty results from LLM SQL: try rule-based fallback once
+                logger.info("LLM SQL returned empty result; trying rule-based fallback")
+                fallback_sql = self._build_rule_based_fallback(nlq, table_name)
+                if fallback_sql and fallback_sql.strip() and fallback_sql.strip() != sql.strip():
+                    fallback_sql = self._post_process_sql(fallback_sql, nlq, table_name)
+                    alt_result = self._execute_with_repair(fallback_sql, nlq, table_name)
+                    # Prefer non-empty fallback results
+                    if alt_result.row_count > 0:
+                        result = alt_result
+                        sql = fallback_sql
+                        result.summary_text = self.llm_manager.summarize_result(nlq, result.data, sql)
+                        used_llm = False
+                        sql_source = "rules"
 
             # Sanitize and cache
             result.data = self._sanitize_dataframe(result.data)
@@ -731,6 +815,13 @@ class NLQSystem:
             # History and metrics
             self._record_query_history(nlq, sql, result)
             self._update_metrics(result, start_time)
+
+            # Cache final SQL used for this NLQ (post-fallback if any)
+            try:
+                if sql and isinstance(sql, str):
+                    self.cache.cache_sql(nlq, sql)
+            except Exception:
+                pass
 
             # Cache result
             if not result.data.isnull().any().any():
@@ -959,6 +1050,9 @@ class NLQSystem:
         avg_execution_time = (self.metrics.total_execution_time /
                              max(1, self.metrics.query_count))
 
+        # Get LLM failure statistics
+        llm_stats = self.llm_manager.get_failure_stats()
+
         return {
             "query_metrics": {
                 "total_queries": self.metrics.query_count,
@@ -975,8 +1069,70 @@ class NLQSystem:
                 "peak_usage_mb": self.metrics.memory_peak_mb,
                 "current_usage_mb": memory_monitor.get_memory_usage(),
             },
+            "llm_metrics": {
+                "llm_success_rate": llm_stats["success_rate_percent"],
+                "llm_total_attempts": llm_stats["total_attempts"],
+                "llm_failures": llm_stats["total_failures"],
+                "llm_failure_breakdown": llm_stats["failure_breakdown"],
+                "last_llm_failure": llm_stats["last_failure"]["reason"] if llm_stats["last_failure"]["reason"] else None
+            },
             "loaded_tables": {
                 name: {"rows": info["total_rows"]}
                 for name, info in self.loaded_tables.items()
             }
         }
+
+    def get_llm_health_status(self) -> Dict[str, Any]:
+        """Get detailed LLM health and failure analysis."""
+        llm_stats = self.llm_manager.get_failure_stats()
+
+        # Analyze failure patterns
+        failure_analysis = {}
+        if llm_stats["total_attempts"] > 0:
+            for failure_type, count in llm_stats["failures"].items():
+                if count > 0:
+                    percentage = (count / llm_stats["total_attempts"]) * 100
+                    failure_analysis[failure_type] = {
+                        "count": count,
+                        "percentage": round(percentage, 2)
+                    }
+
+        return {
+            "llm_ready": self.llm_manager.is_ready(),
+            "model_info": self.llm_manager.get_model_info(),
+            "performance": {
+                "success_rate": llm_stats["success_rate_percent"],
+                "total_attempts": llm_stats["total_attempts"],
+                "successful": llm_stats["successful_generations"],
+                "failed": llm_stats["total_failures"]
+            },
+            "failure_analysis": failure_analysis,
+            "last_failure": llm_stats["last_failure"],
+            "recommendations": self._get_llm_troubleshooting_recommendations(llm_stats)
+        }
+
+    def _get_llm_troubleshooting_recommendations(self, stats: Dict[str, Any]) -> List[str]:
+        """Generate troubleshooting recommendations based on failure patterns."""
+        recommendations = []
+
+        if stats["success_rate_percent"] < 50:
+            recommendations.append("⚠️ Low success rate - consider adjusting model parameters")
+
+        failure_breakdown = stats["failure_breakdown"]
+
+        if failure_breakdown["memory_error"] > failure_breakdown["context_window"]:
+            recommendations.append("💾 Memory errors dominant - consider reducing context window or freeing RAM")
+
+        if failure_breakdown["context_window"] > 0:
+            recommendations.append("📏 Context window issues - try reducing prompt complexity or increasing n_ctx")
+
+        if failure_breakdown["model_error"] > failure_breakdown["validation_error"]:
+            recommendations.append("🔧 Model errors - check model compatibility and file integrity")
+
+        if failure_breakdown["empty_response"] > 0:
+            recommendations.append("📝 Empty responses - model may need temperature adjustment or prompt refinement")
+
+        if len(recommendations) == 0:
+            recommendations.append("✅ LLM performance looks good!")
+
+        return recommendations
